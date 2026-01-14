@@ -14,7 +14,7 @@ from falcon_core.finviz_client import (
     RateLimitConfig,
     fetch_finviz_stocks,
 )
-from falcon_core.config import Config
+from falcon_core.config import FalconConfig, get_config
 
 __version__ = "0.1.0"
 __all__ = [
@@ -24,5 +24,6 @@ __all__ = [
     "get_finviz_client",
     "RateLimitConfig",
     "fetch_finviz_stocks",
-    "Config",
+    "FalconConfig",
+    "get_config",
 ]
