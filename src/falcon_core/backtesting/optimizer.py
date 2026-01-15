@@ -449,15 +449,123 @@ class FeedbackLoop:
     5. Update trading bot configuration
     """
 
+    # Performance thresholds for auto-adjustment
+    MIN_WIN_RATE = 0.35
+    MIN_PROFIT_FACTOR = 0.8
+    MIN_SHARPE_RATIO = 0.5
+
     def __init__(
         self,
-        optimizer: ParameterOptimizer,
+        strategy_class=None,
+        optimizer: ParameterOptimizer = None,
         db_manager=None,
         config_path: str = "/etc/falcon/strategy_params.json",
     ):
+        self.strategy_class = strategy_class
         self.optimizer = optimizer
         self.db = db_manager
         self.config_path = config_path
+
+    def analyze_results(
+        self,
+        backtest_results: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Analyze backtest results and generate parameter adjustment recommendations.
+
+        Args:
+            backtest_results: List of dicts with 'symbol', 'metrics', 'params' keys
+
+        Returns:
+            Dict with adjustment recommendations
+        """
+        if not backtest_results:
+            return {'apply_recommended': False, 'reason': 'No results to analyze'}
+
+        # Aggregate metrics across all symbols
+        total_return = []
+        win_rates = []
+        sharpe_ratios = []
+        total_trades = 0
+
+        for result in backtest_results:
+            metrics = result.get('metrics', {})
+            if 'total_return' in metrics:
+                total_return.append(metrics['total_return'])
+            if 'win_rate' in metrics:
+                win_rates.append(metrics['win_rate'])
+            if 'sharpe_ratio' in metrics:
+                sharpe_ratios.append(metrics['sharpe_ratio'])
+            total_trades += metrics.get('total_trades', 0)
+
+        analysis = {
+            'symbols_analyzed': len(backtest_results),
+            'total_trades': total_trades,
+            'avg_return': sum(total_return) / len(total_return) if total_return else 0,
+            'avg_win_rate': sum(win_rates) / len(win_rates) if win_rates else 0,
+            'avg_sharpe': sum(sharpe_ratios) / len(sharpe_ratios) if sharpe_ratios else 0,
+            'apply_recommended': False,
+            'new_params': {},
+            'adjustments': [],
+        }
+
+        # Check if performance is acceptable
+        performance_ok = True
+        current_params = backtest_results[0].get('params', {}) if backtest_results else {}
+
+        # Win rate check
+        if analysis['avg_win_rate'] < self.MIN_WIN_RATE:
+            performance_ok = False
+            analysis['adjustments'].append({
+                'reason': f"Win rate {analysis['avg_win_rate']:.1%} below threshold {self.MIN_WIN_RATE:.1%}",
+                'suggestion': 'Consider tighter entry criteria',
+            })
+
+        # Sharpe ratio check
+        if analysis['avg_sharpe'] < self.MIN_SHARPE_RATIO:
+            performance_ok = False
+            analysis['adjustments'].append({
+                'reason': f"Sharpe ratio {analysis['avg_sharpe']:.2f} below threshold {self.MIN_SHARPE_RATIO:.2f}",
+                'suggestion': 'Consider adjusting position sizing or stops',
+            })
+
+        # Negative returns
+        if analysis['avg_return'] < 0:
+            performance_ok = False
+            analysis['adjustments'].append({
+                'reason': f"Negative average return {analysis['avg_return']:.2%}",
+                'suggestion': 'Parameters may need re-optimization',
+            })
+
+        # Generate parameter suggestions if strategy class available
+        if not performance_ok and self.strategy_class is not None:
+            try:
+                param_ranges = self.strategy_class.param_ranges()
+                suggested_params = current_params.copy()
+
+                # Adjust based on issues
+                if analysis['avg_win_rate'] < self.MIN_WIN_RATE:
+                    # Try tighter entry conditions
+                    if 'min_volume_multiplier' in param_ranges:
+                        current = suggested_params.get('min_volume_multiplier', 10.0)
+                        suggested_params['min_volume_multiplier'] = current * 1.2
+                    if 'breakout_threshold' in param_ranges:
+                        current = suggested_params.get('breakout_threshold', 0.002)
+                        suggested_params['breakout_threshold'] = current * 1.1
+
+                # Adjust trailing stop if exits too tight
+                if total_trades > 20 and analysis['avg_win_rate'] < 0.3:
+                    if 'atr_multiplier' in param_ranges:
+                        current = suggested_params.get('atr_multiplier', 1.0)
+                        suggested_params['atr_multiplier'] = current * 1.2  # Looser stops
+
+                analysis['new_params'] = suggested_params
+                analysis['apply_recommended'] = len(suggested_params) > 0
+
+            except Exception as e:
+                logger.warning(f"Failed to generate param suggestions: {e}")
+
+        return analysis
 
     def run_daily_analysis(self, strategy_name: str) -> Dict[str, Any]:
         """

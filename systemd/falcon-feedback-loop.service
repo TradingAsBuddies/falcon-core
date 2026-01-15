@@ -1,0 +1,38 @@
+[Unit]
+Description=Falcon Trading Feedback Loop Scheduler
+Documentation=https://github.com/TradingAsBuddies/falcon-core
+After=network.target
+
+[Service]
+Type=simple
+User=falcon
+Group=falcon
+
+# Working directory
+WorkingDirectory=/opt/falcon
+
+# Environment variables
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/falcon/environment
+
+# Run as daemon with scheduler (11:30 AM ET daily, Mon-Fri)
+ExecStart=/opt/falcon/venv/bin/python -m falcon_core.backtesting.scheduler --daemon --time 11:30
+
+# Restart on failure
+Restart=on-failure
+RestartSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=falcon-feedback
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/falcon /home/falcon/.local/share/falcon /home/falcon/.config/falcon
+
+[Install]
+WantedBy=multi-user.target

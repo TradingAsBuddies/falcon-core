@@ -18,7 +18,7 @@ Priority for intraday data:
 
 import os
 import logging
-from datetime import datetime, timedelta, time as dt_time
+from datetime import date, datetime, timedelta, time as dt_time
 from typing import Any, Dict, List, Optional, Union
 import pandas as pd
 
@@ -122,13 +122,18 @@ class DataFeed:
         Returns:
             DataFrame with columns: open, high, low, close, volume
         """
-        # Parse dates
+        # Parse dates - handle date, datetime, or string
         if isinstance(start_date, str):
             start_date = datetime.strptime(start_date, "%Y-%m-%d")
+        elif isinstance(start_date, date) and not isinstance(start_date, datetime):
+            start_date = datetime.combine(start_date, datetime.min.time())
+
         if end_date is None:
             end_date = datetime.now()
         elif isinstance(end_date, str):
             end_date = datetime.strptime(end_date, "%Y-%m-%d")
+        elif isinstance(end_date, date) and not isinstance(end_date, datetime):
+            end_date = datetime.combine(end_date, datetime.max.time().replace(microsecond=0))
 
         # Check cache first
         cache_key = f"{symbol}_{interval}_{start_date.date()}_{end_date.date()}_{market_hours_only}"

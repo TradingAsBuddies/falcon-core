@@ -1,0 +1,20 @@
+# Falcon Feedback Loop Environment Configuration
+# Copy to /etc/falcon/environment and fill in values
+
+# Polygon.io API Key
+POLYGON_API_KEY=your_polygon_api_key_here
+
+# Massive S3 credentials for flat files
+MASSIVE_ACCESS_KEY=your_massive_access_key_here
+MASSIVE_SECRET_KEY=your_massive_secret_key_here
+MASSIVE_ENDPOINT=https://files.massive.com
+MASSIVE_BUCKET=flatfiles
+
+# Optional: Notification webhook (Slack/Discord)
+# NOTIFY_WEBHOOK=https://hooks.slack.com/services/xxx/xxx/xxx
+
+# Optional: Auto-apply parameter adjustments
+# AUTO_APPLY_ADJUSTMENTS=true
+
+# Database path (default: ~/.local/share/falcon/backtest_results.db)
+# DB_PATH=/var/lib/falcon/backtest_results.db
