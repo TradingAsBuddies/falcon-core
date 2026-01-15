@@ -4,6 +4,8 @@ One Candle Rule Support/Resistance Retest Strategy
 Source: Scarface Trades (aka Tony, aka Raph) - Chart Fanatics
 Style: Scalping/Day Trading (9:30 AM - 11:00 AM Eastern time window)
 
+*** INTRADAY STRATEGY - REQUIRES 1-MINUTE DATA ***
+
 Entry Rules:
 1. Identify clear support/resistance level
 2. Wait for price to break above resistance (or below support for shorts)
@@ -16,7 +18,8 @@ Exit Rules:
 - Stop loss below the support level being retested
 - Target 1:2 risk-to-reward ratio
 
-Primary timeframe: 1-minute chart (but uses multiple timeframes for context)
+Primary timeframe: 1-minute chart
+Trading window: 9:30 AM - 11:00 AM ET (first 90 minutes)
 """
 
 from dataclasses import dataclass
@@ -35,20 +38,27 @@ from falcon_core.backtesting.strategies.base import (
 
 @dataclass
 class OneCandleRuleParams(StrategyParams):
-    """Parameters for One Candle Rule strategy"""
+    """
+    Parameters for One Candle Rule strategy.
+
+    Optimized for 1-minute intraday data.
+    """
+
+    # Timeframe (for documentation)
+    recommended_interval: str = "1m"
 
     # Support/Resistance detection
-    sr_lookback: int = 20  # Candles to look back for S/R levels
-    sr_tolerance: float = 0.002  # 0.2% tolerance for level touches
+    sr_lookback: int = 30  # 30 minutes of data for S/R detection
+    sr_tolerance: float = 0.001  # 0.1% tolerance (tighter for 1-min)
     min_level_touches: int = 2  # Minimum touches to confirm S/R level
 
     # Breakout detection
-    breakout_threshold: float = 0.003  # 0.3% beyond level to confirm breakout
-    min_breakout_volume_mult: float = 1.2  # Volume must be 1.2x average
+    breakout_threshold: float = 0.002  # 0.2% beyond level (tighter for intraday)
+    min_breakout_volume_mult: float = 1.5  # Volume must be 1.5x average
 
     # Retest detection
-    retest_tolerance: float = 0.005  # 0.5% tolerance for retest
-    max_retest_candles: int = 10  # Max candles to wait for retest
+    retest_tolerance: float = 0.003  # 0.3% tolerance for retest
+    max_retest_candles: int = 15  # Max 15 minutes to wait for retest
 
     # Confirmation candle
     min_wick_body_ratio: float = 1.5  # Lower wick must be 1.5x body for hammer
@@ -56,11 +66,15 @@ class OneCandleRuleParams(StrategyParams):
 
     # Risk management
     risk_reward_ratio: float = 2.0  # Target 1:2 R/R
-    default_stop_loss_pct: float = 0.02  # 2% stop if no clear level
+    default_stop_loss_pct: float = 0.01  # 1% stop for intraday (tighter)
 
-    # Time filter
-    trade_start_time: str = "09:30"
-    trade_end_time: str = "11:00"  # Only trade first 1.5 hours
+    # Position sizing
+    position_size: float = 10000.0  # Smaller for scalping
+
+    # Time filter - CRITICAL for this strategy
+    trade_start_time: str = "09:35"  # Start 5 min after open (let dust settle)
+    trade_end_time: str = "11:00"  # Only trade first 90 minutes
+    no_new_trades_after: str = "10:45"  # Don't enter new trades in last 15 min
 
     @classmethod
     def from_dict(cls, data: Dict) -> "OneCandleRuleParams":

@@ -4,6 +4,8 @@ Market Memory Model (Second Day Trading Strategy)
 Source: Unknown Creator (YouTube extraction)
 Style: Day trading
 
+*** INTRADAY STRATEGY - REQUIRES 5-MINUTE DATA FOR DAY 2 ***
+
 Concept:
 The market "remembers" yesterday's key levels. Day 2 of a big move
 often sees price test and react to yesterday's high, low, and
@@ -23,6 +25,11 @@ Exit Rules:
 - Move to breakeven as trade progresses
 - Target: opposite side of yesterday's range
 - Can hold through VWAP for extended targets
+
+Best Candidates:
+- Stocks with 5%+ Day 1 move
+- Clear catalyst (earnings, news)
+- Day 2 opens inside or near Day 1 range
 """
 
 from dataclasses import dataclass
@@ -41,14 +48,22 @@ from falcon_core.backtesting.strategies.base import (
 
 @dataclass
 class MarketMemoryParams(StrategyParams):
-    """Parameters for Market Memory Model strategy"""
+    """
+    Parameters for Market Memory Model strategy.
+
+    Optimized for 5-minute intraday data, specifically for Day 2 setups
+    after a significant Day 1 move.
+    """
+
+    # Timeframe
+    recommended_interval: str = "5m"
 
     # Day 1 move qualification
     min_day1_move_pct: float = 0.05  # 5% minimum move on Day 1
     min_day1_volume_mult: float = 1.5  # 1.5x average volume on Day 1
 
     # Key level zones
-    zone_tolerance: float = 0.005  # 0.5% tolerance for level zones
+    zone_tolerance: float = 0.003  # 0.3% tolerance for level zones (tighter for intraday)
     range_middle_pct: float = 0.3  # Avoid middle 30% of range
 
     # John Wick candle detection
@@ -57,15 +72,20 @@ class MarketMemoryParams(StrategyParams):
     min_candle_range_atr: float = 0.5  # Min candle range as % of ATR
 
     # Trade management
-    breakeven_trigger_pct: float = 0.01  # Move stop to BE after 1% profit
+    breakeven_trigger_pct: float = 0.005  # Move stop to BE after 0.5% profit (tighter for intraday)
     target_range_mult: float = 1.0  # Target opposite side of range
 
     # Position sizing
-    position_size: float = 25000.0
+    position_size: float = 20000.0
 
-    # Time filter
-    trade_start_time: str = "09:30"
-    trade_end_time: str = "15:00"
+    # Time filter - CRITICAL for Day 2 setups
+    trade_start_time: str = "09:35"  # Start 5 min after open
+    trade_end_time: str = "15:00"  # Stop 1 hour before close
+    prime_window_start: str = "09:35"  # Best setups in first 90 min
+    prime_window_end: str = "11:00"
+
+    # Risk management
+    max_risk_per_trade_pct: float = 0.01  # 1% max risk per trade
 
     @classmethod
     def from_dict(cls, data: Dict) -> "MarketMemoryParams":

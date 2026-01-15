@@ -5,12 +5,18 @@ Loads market data from various sources:
 - Database (TimescaleDB/PostgreSQL)
 - CSV files
 - yfinance (for historical data)
-- Polygon.io API
+- Polygon.io API (for intraday data)
+
+Priority for intraday data:
+1. Polygon.io (best quality, requires API key)
+2. yfinance (free, but limited history)
+3. Database (if populated)
+4. CSV files (manual import)
 """
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import Any, Dict, List, Optional, Union
 import pandas as pd
 
@@ -22,23 +28,52 @@ class DataFeed:
     Market data feed for backtesting.
 
     Supports multiple data sources with a unified interface.
+    Optimized for intraday trading strategy development.
     """
 
-    def __init__(self, db_manager=None, cache_dir: Optional[str] = None):
+    # Market hours (Eastern Time)
+    MARKET_OPEN = dt_time(9, 30)
+    MARKET_CLOSE = dt_time(16, 0)
+    PREMARKET_START = dt_time(4, 0)
+    AFTERHOURS_END = dt_time(20, 0)
+
+    def __init__(
+        self,
+        db_manager=None,
+        cache_dir: Optional[str] = None,
+        polygon_api_key: Optional[str] = None,
+    ):
         """
         Initialize data feed.
 
         Args:
             db_manager: DatabaseManager instance for DB queries
             cache_dir: Directory to cache downloaded data
+            polygon_api_key: Polygon.io API key for intraday data
         """
         self.db = db_manager
-        self.cache_dir = cache_dir or "/var/cache/falcon/market_data"
+        self.cache_dir = cache_dir or os.path.expanduser("~/.cache/falcon/market_data")
         self._cache: Dict[str, pd.DataFrame] = {}
+        self._polygon_client = None
+        self._polygon_api_key = polygon_api_key or os.getenv('POLYGON_API_KEY')
 
         # Ensure cache directory exists
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
+
+    @property
+    def polygon(self):
+        """Lazy-load Polygon client"""
+        if self._polygon_client is None and self._polygon_api_key:
+            try:
+                from falcon_core.backtesting.polygon_client import PolygonClient
+                self._polygon_client = PolygonClient(
+                    api_key=self._polygon_api_key,
+                    cache_dir=self.cache_dir,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize Polygon client: {e}")
+        return self._polygon_client
 
     def get_historical_data(
         self,
@@ -47,6 +82,7 @@ class DataFeed:
         end_date: Union[str, datetime, None] = None,
         interval: str = "1d",
         source: str = "auto",
+        market_hours_only: bool = True,
     ) -> pd.DataFrame:
         """
         Get historical OHLCV data for a symbol.
@@ -55,8 +91,9 @@ class DataFeed:
             symbol: Stock ticker symbol
             start_date: Start date for data
             end_date: End date (default: today)
-            interval: Data interval ('1m', '5m', '1h', '1d')
-            source: Data source ('auto', 'database', 'yfinance', 'csv')
+            interval: Data interval ('1m', '5m', '15m', '1h', '1d')
+            source: Data source ('auto', 'polygon', 'database', 'yfinance', 'csv')
+            market_hours_only: Filter to regular market hours (9:30 AM - 4:00 PM ET)
 
         Returns:
             DataFrame with columns: open, high, low, close, volume
@@ -70,18 +107,29 @@ class DataFeed:
             end_date = datetime.strptime(end_date, "%Y-%m-%d")
 
         # Check cache first
-        cache_key = f"{symbol}_{interval}_{start_date.date()}_{end_date.date()}"
+        cache_key = f"{symbol}_{interval}_{start_date.date()}_{end_date.date()}_{market_hours_only}"
         if cache_key in self._cache:
             return self._cache[cache_key].copy()
+
+        # Determine if intraday
+        is_intraday = interval in ['1m', '5m', '15m', '30m', '1h']
 
         # Try sources in order
         data = None
 
         if source == "auto":
-            # Try database first, then yfinance
-            data = self._try_database(symbol, start_date, end_date, interval)
-            if data is None or data.empty:
-                data = self._try_yfinance(symbol, start_date, end_date, interval)
+            if is_intraday:
+                # For intraday: try Polygon first, then yfinance
+                data = self._try_polygon(symbol, start_date, end_date, interval)
+                if data is None or data.empty:
+                    data = self._try_yfinance(symbol, start_date, end_date, interval)
+            else:
+                # For daily: try database first, then yfinance
+                data = self._try_database(symbol, start_date, end_date, interval)
+                if data is None or data.empty:
+                    data = self._try_yfinance(symbol, start_date, end_date, interval)
+        elif source == "polygon":
+            data = self._try_polygon(symbol, start_date, end_date, interval)
         elif source == "database":
             data = self._try_database(symbol, start_date, end_date, interval)
         elif source == "yfinance":
@@ -92,10 +140,66 @@ class DataFeed:
         if data is None or data.empty:
             raise ValueError(f"No data found for {symbol} from {start_date} to {end_date}")
 
+        # Filter to market hours if requested
+        if is_intraday and market_hours_only:
+            data = self._filter_market_hours(data)
+
         # Cache the result
         self._cache[cache_key] = data
 
         return data.copy()
+
+    def _try_polygon(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime,
+        interval: str,
+    ) -> Optional[pd.DataFrame]:
+        """Try to load data from Polygon.io"""
+        if self.polygon is None:
+            logger.debug("Polygon client not available")
+            return None
+
+        try:
+            data = self.polygon.get_multi_day_intraday(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                interval=interval,
+            )
+
+            if not data.empty:
+                logger.info(f"Loaded {len(data)} bars for {symbol} from Polygon.io")
+            return data
+
+        except Exception as e:
+            logger.warning(f"Polygon query failed for {symbol}: {e}")
+            return None
+
+    def _filter_market_hours(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Filter data to regular market hours (9:30 AM - 4:00 PM ET)"""
+        if data.empty:
+            return data
+
+        # Ensure timezone aware
+        if data.index.tz is None:
+            # Assume UTC if no timezone
+            data.index = data.index.tz_localize('UTC')
+
+        # Convert to Eastern time for filtering
+        data_et = data.copy()
+        data_et.index = data_et.index.tz_convert('America/New_York')
+
+        # Filter to market hours
+        mask = (
+            (data_et.index.time >= self.MARKET_OPEN) &
+            (data_et.index.time < self.MARKET_CLOSE)
+        )
+
+        filtered = data[mask.values]
+        logger.debug(f"Filtered {len(data)} -> {len(filtered)} bars (market hours only)")
+        return filtered
 
     def _try_database(
         self,
@@ -306,3 +410,163 @@ class DataFeed:
         """Clear in-memory cache"""
         self._cache.clear()
         logger.info("Data feed cache cleared")
+
+    def get_intraday_bars(
+        self,
+        symbol: str,
+        trading_date: Union[str, datetime],
+        interval: str = "5m",
+        include_premarket: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Get intraday bars for a single trading day.
+
+        Optimized for day trading strategy backtesting.
+
+        Args:
+            symbol: Stock ticker
+            trading_date: The trading date
+            interval: '1m', '5m', '15m'
+            include_premarket: Include 4:00 AM - 9:30 AM data
+
+        Returns:
+            DataFrame with OHLCV data for the trading day
+        """
+        if isinstance(trading_date, str):
+            trading_date = datetime.strptime(trading_date, "%Y-%m-%d")
+
+        data = self.get_historical_data(
+            symbol=symbol,
+            start_date=trading_date,
+            end_date=trading_date,
+            interval=interval,
+            market_hours_only=not include_premarket,
+        )
+
+        return data
+
+    def get_multi_day_intraday(
+        self,
+        symbol: str,
+        start_date: Union[str, datetime],
+        end_date: Union[str, datetime],
+        interval: str = "5m",
+    ) -> pd.DataFrame:
+        """
+        Get intraday data spanning multiple days.
+
+        Args:
+            symbol: Stock ticker
+            start_date: Start date
+            end_date: End date
+            interval: Bar interval
+
+        Returns:
+            DataFrame with multi-day intraday data
+        """
+        return self.get_historical_data(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            interval=interval,
+            market_hours_only=True,
+        )
+
+    def get_day2_data(
+        self,
+        symbol: str,
+        day1_date: Union[str, datetime],
+        interval: str = "5m",
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Get data for Day 1 and Day 2 of a move (for Market Memory strategy).
+
+        Args:
+            symbol: Stock ticker
+            day1_date: The "Day 1" date (big move day)
+            interval: Bar interval
+
+        Returns:
+            Dict with 'day1' and 'day2' DataFrames
+        """
+        if isinstance(day1_date, str):
+            day1_date = datetime.strptime(day1_date, "%Y-%m-%d")
+
+        # Day 2 is the next trading day
+        day2_date = day1_date + timedelta(days=1)
+        # Skip weekends
+        while day2_date.weekday() >= 5:
+            day2_date += timedelta(days=1)
+
+        day1_data = self.get_intraday_bars(symbol, day1_date, interval)
+        day2_data = self.get_intraday_bars(symbol, day2_date, interval)
+
+        return {
+            'day1': day1_data,
+            'day2': day2_data,
+            'day1_date': day1_date,
+            'day2_date': day2_date,
+        }
+
+    def get_gappers(
+        self,
+        symbols: List[str],
+        trading_date: Union[str, datetime],
+        min_gap_pct: float = 0.03,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find stocks that gapped up/down on a given date.
+
+        Useful for finding candidates for intraday strategies.
+
+        Args:
+            symbols: List of symbols to check
+            trading_date: The trading date
+            min_gap_pct: Minimum gap percentage (e.g., 0.03 = 3%)
+
+        Returns:
+            List of dicts with symbol, gap_pct, prev_close, open_price
+        """
+        if isinstance(trading_date, str):
+            trading_date = datetime.strptime(trading_date, "%Y-%m-%d")
+
+        prev_date = trading_date - timedelta(days=1)
+        while prev_date.weekday() >= 5:
+            prev_date -= timedelta(days=1)
+
+        gappers = []
+
+        for symbol in symbols:
+            try:
+                # Get previous close
+                prev_data = self.get_historical_data(
+                    symbol, prev_date, prev_date, '1d'
+                )
+                if prev_data.empty:
+                    continue
+                prev_close = prev_data['close'].iloc[-1]
+
+                # Get today's open
+                today_data = self.get_intraday_bars(symbol, trading_date, '5m')
+                if today_data.empty:
+                    continue
+                today_open = today_data['open'].iloc[0]
+
+                # Calculate gap
+                gap_pct = (today_open - prev_close) / prev_close
+
+                if abs(gap_pct) >= min_gap_pct:
+                    gappers.append({
+                        'symbol': symbol,
+                        'gap_pct': gap_pct,
+                        'prev_close': prev_close,
+                        'open_price': today_open,
+                        'direction': 'up' if gap_pct > 0 else 'down',
+                    })
+
+            except Exception as e:
+                logger.debug(f"Failed to check gap for {symbol}: {e}")
+
+        # Sort by absolute gap size
+        gappers.sort(key=lambda x: abs(x['gap_pct']), reverse=True)
+        return gappers

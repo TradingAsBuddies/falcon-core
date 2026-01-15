@@ -4,6 +4,8 @@ ATR Trailing Stop Breakout Strategy
 Source: Treyding Stocks
 Style: Day trading, breakout trading
 
+*** INTRADAY STRATEGY - OPTIMIZED FOR 5-MINUTE DATA ***
+
 Entry Rules:
 1. Price must close above the "cyan line" (highest high of previous 10 candles minus ATR)
 2. Volume on the breakout candle must be at least 10x the number of shares being purchased
@@ -18,6 +20,11 @@ Exit Rules:
 Risk Management:
 - Default $25,000 position size (configurable)
 - Liquidity requirement: Volume must be at least 10x shares to ensure fills
+
+Best Candidates:
+- Gappers (3%+ gap at open)
+- High relative volume (>2x normal)
+- Clear catalyst (earnings, news)
 """
 
 from dataclasses import dataclass
@@ -35,15 +42,23 @@ from falcon_core.backtesting.strategies.base import (
 
 @dataclass
 class ATRBreakoutParams(StrategyParams):
-    """Parameters for ATR Trailing Stop Breakout strategy"""
+    """
+    Parameters for ATR Trailing Stop Breakout strategy.
 
-    # ATR calculation
-    atr_period: int = 14  # ATR lookback period
-    highest_high_period: int = 10  # Period for highest high calculation
+    Optimized for 5-minute intraday data on gapping stocks.
+    """
+
+    # Timeframe
+    recommended_interval: str = "5m"
+
+    # ATR calculation (in 5-min bars)
+    atr_period: int = 14  # 14 bars = ~70 minutes of data
+    highest_high_period: int = 10  # 10 bars = ~50 minutes
 
     # Entry conditions
     min_volume_multiplier: float = 10.0  # Volume must be 10x shares purchased
-    min_gap_pct: float = 0.02  # 2% minimum gap for "gapper" qualification
+    min_gap_pct: float = 0.03  # 3% minimum gap for "gapper" qualification
+    min_relative_volume: float = 2.0  # Relative volume vs 20-bar average
 
     # Position sizing
     position_size: float = 25000.0  # Default $25K position
@@ -52,8 +67,12 @@ class ATRBreakoutParams(StrategyParams):
     atr_multiplier: float = 1.0  # Multiply ATR by this for stop distance
 
     # Time filter
-    trade_start_time: str = "09:30"
-    trade_end_time: str = "15:30"
+    trade_start_time: str = "09:35"  # 5 min after open
+    trade_end_time: str = "15:30"  # Stop 30 min before close
+    no_new_trades_after: str = "14:30"  # No new entries in last hour
+
+    # Daily loss limit
+    max_daily_loss_pct: float = 0.02  # 2% max daily loss
 
     @classmethod
     def from_dict(cls, data: Dict) -> "ATRBreakoutParams":
