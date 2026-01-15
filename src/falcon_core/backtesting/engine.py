@@ -424,21 +424,25 @@ class BTBacktestEngine(BacktestEngine):
         # Generate signals from our strategy
         signals = strategy.run(data, symbol)
 
-        # Convert signals to bt format
-        signal_series = self._signals_to_weights(signals, data)
+        # Prepare data for bt (needs price data with symbol as column name)
+        price_data = data[['close']].copy()
+        price_data.columns = [symbol]
+
+        # Remove timezone info if present (bt doesn't handle tz well)
+        if price_data.index.tz is not None:
+            price_data.index = price_data.index.tz_localize(None)
+
+        # Convert signals to bt format (weights DataFrame)
+        signal_weights = self._signals_to_weights(signals, price_data, symbol)
 
         # Create bt strategy
         bt_strategy = self._bt.Strategy(
             strategy.name,
             [
-                self._bt.algos.WeighTarget(signal_series),
+                self._bt.algos.WeighTarget(signal_weights),
                 self._bt.algos.Rebalance(),
             ]
         )
-
-        # Prepare data for bt (needs price data with symbol as column name)
-        price_data = data[['close']].copy()
-        price_data.columns = [symbol]
 
         # Run backtest
         backtest = self._bt.Backtest(bt_strategy, price_data)
@@ -451,17 +455,31 @@ class BTBacktestEngine(BacktestEngine):
         self,
         signals: List[Signal],
         data: pd.DataFrame,
+        symbol: str,
     ) -> pd.DataFrame:
         """Convert signal list to weight DataFrame for bt"""
         # Create weight series (0 = no position, 1 = full position)
-        weights = pd.Series(0.0, index=data.index)
+        # bt requires weights to have symbol as column name
+        weights = pd.DataFrame(0.0, index=data.index, columns=[symbol])
 
         in_position = False
         for signal in signals:
             idx = signal.timestamp
+
+            # Strip timezone if present to match data index
+            if hasattr(idx, 'tzinfo') and idx.tzinfo is not None:
+                idx = idx.replace(tzinfo=None)
+
             if idx not in weights.index:
                 # Find nearest index
-                idx = weights.index[weights.index.get_indexer([idx], method='nearest')[0]]
+                try:
+                    nearest_idx = weights.index.get_indexer([idx], method='nearest')[0]
+                    if nearest_idx >= 0:
+                        idx = weights.index[nearest_idx]
+                    else:
+                        continue
+                except Exception:
+                    continue
 
             if signal.signal_type == SignalType.LONG:
                 in_position = True
@@ -469,9 +487,9 @@ class BTBacktestEngine(BacktestEngine):
                 in_position = False
 
             # Set weight from this point forward
-            weights.loc[idx:] = 1.0 if in_position else 0.0
+            weights.loc[idx:, symbol] = 1.0 if in_position else 0.0
 
-        return weights.to_frame(name='weight')
+        return weights
 
     def _extract_metrics(
         self,
