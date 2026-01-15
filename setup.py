@@ -22,12 +22,16 @@ setup(
             "bt>=0.2.9",          # MIT license - event-driven backtesting
             "ffn>=0.3.6",         # MIT license - financial functions
             "yfinance>=0.2.28",   # Apache 2.0 - historical data
+            "boto3>=1.34.0",      # Apache 2.0 - S3 access for flat files
+            "pyarrow>=14.0.0",    # Apache 2.0 - parquet caching
         ],
         "full": [
             "psycopg2-binary>=2.9.9",
             "bt>=0.2.9",
             "ffn>=0.3.6",
             "yfinance>=0.2.28",
+            "boto3>=1.34.0",
+            "pyarrow>=14.0.0",
         ],
     },
     entry_points={

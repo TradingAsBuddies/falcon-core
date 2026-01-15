@@ -2,16 +2,18 @@
 Data Feed for Falcon Backtesting
 
 Loads market data from various sources:
+- Massive Flat Files (bulk historical via S3)
+- Polygon.io API (for intraday data)
 - Database (TimescaleDB/PostgreSQL)
 - CSV files
 - yfinance (for historical data)
-- Polygon.io API (for intraday data)
 
 Priority for intraday data:
-1. Polygon.io (best quality, requires API key)
-2. yfinance (free, but limited history)
-3. Database (if populated)
-4. CSV files (manual import)
+1. Massive Flat Files (fastest, no rate limits, 20+ years history)
+2. Polygon.io API (real-time, requires API key)
+3. yfinance (free, but limited history)
+4. Database (if populated)
+5. CSV files (manual import)
 """
 
 import os
@@ -42,6 +44,8 @@ class DataFeed:
         db_manager=None,
         cache_dir: Optional[str] = None,
         polygon_api_key: Optional[str] = None,
+        massive_access_key: Optional[str] = None,
+        massive_secret_key: Optional[str] = None,
     ):
         """
         Initialize data feed.
@@ -50,12 +54,17 @@ class DataFeed:
             db_manager: DatabaseManager instance for DB queries
             cache_dir: Directory to cache downloaded data
             polygon_api_key: Polygon.io API key for intraday data
+            massive_access_key: Massive S3 access key for flat files
+            massive_secret_key: Massive S3 secret key for flat files
         """
         self.db = db_manager
         self.cache_dir = cache_dir or os.path.expanduser("~/.cache/falcon/market_data")
         self._cache: Dict[str, pd.DataFrame] = {}
         self._polygon_client = None
+        self._flatfiles_client = None
         self._polygon_api_key = polygon_api_key or os.getenv('POLYGON_API_KEY')
+        self._massive_access_key = massive_access_key or os.getenv('MASSIVE_ACCESS_KEY')
+        self._massive_secret_key = massive_secret_key or os.getenv('MASSIVE_SECRET_KEY')
 
         # Ensure cache directory exists
         if self.cache_dir:
@@ -75,6 +84,21 @@ class DataFeed:
                 logger.warning(f"Failed to initialize Polygon client: {e}")
         return self._polygon_client
 
+    @property
+    def flatfiles(self):
+        """Lazy-load Flat Files client (Massive S3)"""
+        if self._flatfiles_client is None and self._massive_access_key and self._massive_secret_key:
+            try:
+                from falcon_core.backtesting.flatfiles_client import FlatFilesClient
+                self._flatfiles_client = FlatFilesClient(
+                    access_key=self._massive_access_key,
+                    secret_key=self._massive_secret_key,
+                    cache_dir=self.cache_dir,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize Flat Files client: {e}")
+        return self._flatfiles_client
+
     def get_historical_data(
         self,
         symbol: str,
@@ -92,7 +116,7 @@ class DataFeed:
             start_date: Start date for data
             end_date: End date (default: today)
             interval: Data interval ('1m', '5m', '15m', '1h', '1d')
-            source: Data source ('auto', 'polygon', 'database', 'yfinance', 'csv')
+            source: Data source ('auto', 'flatfiles', 'polygon', 'database', 'yfinance', 'csv')
             market_hours_only: Filter to regular market hours (9:30 AM - 4:00 PM ET)
 
         Returns:
@@ -119,15 +143,21 @@ class DataFeed:
 
         if source == "auto":
             if is_intraday:
-                # For intraday: try Polygon first, then yfinance
-                data = self._try_polygon(symbol, start_date, end_date, interval)
+                # For intraday: try Flat Files first (fastest), then Polygon API, then yfinance
+                data = self._try_flatfiles(symbol, start_date, end_date, interval)
+                if data is None or data.empty:
+                    data = self._try_polygon(symbol, start_date, end_date, interval)
                 if data is None or data.empty:
                     data = self._try_yfinance(symbol, start_date, end_date, interval)
             else:
-                # For daily: try database first, then yfinance
-                data = self._try_database(symbol, start_date, end_date, interval)
+                # For daily: try flat files, then database, then yfinance
+                data = self._try_flatfiles(symbol, start_date, end_date, interval)
+                if data is None or data.empty:
+                    data = self._try_database(symbol, start_date, end_date, interval)
                 if data is None or data.empty:
                     data = self._try_yfinance(symbol, start_date, end_date, interval)
+        elif source == "flatfiles":
+            data = self._try_flatfiles(symbol, start_date, end_date, interval)
         elif source == "polygon":
             data = self._try_polygon(symbol, start_date, end_date, interval)
         elif source == "database":
@@ -148,6 +178,69 @@ class DataFeed:
         self._cache[cache_key] = data
 
         return data.copy()
+
+    def _try_flatfiles(
+        self,
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime,
+        interval: str,
+    ) -> Optional[pd.DataFrame]:
+        """Try to load data from Massive Flat Files (S3)"""
+        if self.flatfiles is None:
+            logger.debug("Flat Files client not available")
+            return None
+
+        try:
+            if interval == "1d":
+                # Daily aggregates
+                data = self.flatfiles.get_daily_bars(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            else:
+                # Minute aggregates (flat files are 1-minute, we'll resample if needed)
+                data = self.flatfiles.get_multi_day_minute_bars(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+
+                # Resample if not 1-minute
+                if not data.empty and interval != "1m":
+                    data = self._resample_bars(data, interval)
+
+            if not data.empty:
+                logger.info(f"Loaded {len(data)} bars for {symbol} from Flat Files")
+            return data
+
+        except Exception as e:
+            logger.warning(f"Flat Files query failed for {symbol}: {e}")
+            return None
+
+    def _resample_bars(self, data: pd.DataFrame, interval: str) -> pd.DataFrame:
+        """Resample minute bars to a different interval"""
+        interval_map = {
+            '5m': '5min',
+            '15m': '15min',
+            '30m': '30min',
+            '1h': '1H',
+        }
+
+        if interval not in interval_map:
+            return data
+
+        resampled = data.resample(interval_map[interval]).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+        }).dropna()
+
+        logger.debug(f"Resampled {len(data)} 1m bars to {len(resampled)} {interval} bars")
+        return resampled
 
     def _try_polygon(
         self,
@@ -197,7 +290,11 @@ class DataFeed:
             (data_et.index.time < self.MARKET_CLOSE)
         )
 
-        filtered = data[mask.values]
+        # Handle both Series and ndarray masks
+        if hasattr(mask, 'values'):
+            filtered = data[mask.values]
+        else:
+            filtered = data[mask]
         logger.debug(f"Filtered {len(data)} -> {len(filtered)} bars (market hours only)")
         return filtered
 
