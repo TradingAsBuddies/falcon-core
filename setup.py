@@ -25,6 +25,11 @@ setup(
             "boto3>=1.34.0",      # Apache 2.0 - S3 access for flat files
             "pyarrow>=14.0.0",    # Apache 2.0 - parquet caching
         ],
+        "data-sync": [
+            "psycopg2-binary>=2.9.9",
+            "boto3>=1.34.0",
+            "pyarrow>=14.0.0",
+        ],
         "full": [
             "psycopg2-binary>=2.9.9",
             "bt>=0.2.9",
@@ -37,6 +42,7 @@ setup(
     entry_points={
         "console_scripts": [
             "falcon-backtest=falcon_core.backtesting.cli:main",
+            "falcon-data-sync=falcon_core.data_sync_cli:main",
         ],
     },
     classifiers=[

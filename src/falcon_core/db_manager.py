@@ -185,6 +185,7 @@ class DatabaseManager:
         self._create_trading_tables()
         self._create_youtube_strategy_tables()
         self._create_screener_tables()
+        self._create_market_data_tables()
         logger.info("Database schema initialized successfully")
 
     def _create_trading_tables(self):
@@ -514,6 +515,116 @@ class DatabaseManager:
 
         logger.info("Screener profile tables created")
 
+    def _create_market_data_tables(self):
+        """Create market data tables for Polygon flat files sync"""
+
+        if self.db_type == 'sqlite':
+            daily_bars_sql = '''
+                CREATE TABLE IF NOT EXISTS daily_bars (
+                    symbol TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume INTEGER,
+                    vwap REAL,
+                    trades INTEGER,
+                    PRIMARY KEY (symbol, date)
+                )
+            '''
+            minute_bars_sql = '''
+                CREATE TABLE IF NOT EXISTS minute_bars (
+                    symbol TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume INTEGER,
+                    vwap REAL,
+                    trades INTEGER,
+                    PRIMARY KEY (symbol, timestamp)
+                )
+            '''
+            sync_log_sql = '''
+                CREATE TABLE IF NOT EXISTS sync_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sync_type TEXT NOT NULL,
+                    sync_date TEXT NOT NULL,
+                    file_key TEXT NOT NULL,
+                    rows_loaded INTEGER DEFAULT 0,
+                    duration_seconds REAL,
+                    status TEXT DEFAULT 'success',
+                    error_message TEXT,
+                    completed_at TEXT,
+                    UNIQUE(sync_type, sync_date)
+                )
+            '''
+            daily_index_sql = '''
+                CREATE INDEX IF NOT EXISTS idx_daily_bars_date ON daily_bars(date)
+            '''
+            minute_index_sql = '''
+                CREATE INDEX IF NOT EXISTS idx_minute_bars_timestamp ON minute_bars(timestamp)
+            '''
+        else:  # postgresql
+            daily_bars_sql = '''
+                CREATE TABLE IF NOT EXISTS daily_bars (
+                    symbol VARCHAR(10) NOT NULL,
+                    date DATE NOT NULL,
+                    open DECIMAL(12,4),
+                    high DECIMAL(12,4),
+                    low DECIMAL(12,4),
+                    close DECIMAL(12,4),
+                    volume BIGINT,
+                    vwap DECIMAL(12,4),
+                    trades INTEGER,
+                    PRIMARY KEY (symbol, date)
+                )
+            '''
+            minute_bars_sql = '''
+                CREATE TABLE IF NOT EXISTS minute_bars (
+                    symbol VARCHAR(10) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    open DECIMAL(12,4),
+                    high DECIMAL(12,4),
+                    low DECIMAL(12,4),
+                    close DECIMAL(12,4),
+                    volume BIGINT,
+                    vwap DECIMAL(12,4),
+                    trades INTEGER,
+                    PRIMARY KEY (symbol, timestamp)
+                )
+            '''
+            sync_log_sql = '''
+                CREATE TABLE IF NOT EXISTS sync_log (
+                    id SERIAL PRIMARY KEY,
+                    sync_type VARCHAR(20) NOT NULL,
+                    sync_date DATE NOT NULL,
+                    file_key VARCHAR(200) NOT NULL,
+                    rows_loaded INTEGER DEFAULT 0,
+                    duration_seconds DECIMAL(10,2),
+                    status VARCHAR(20) DEFAULT 'success',
+                    error_message TEXT,
+                    completed_at TIMESTAMP,
+                    UNIQUE(sync_type, sync_date)
+                )
+            '''
+            daily_index_sql = '''
+                CREATE INDEX IF NOT EXISTS idx_daily_bars_date ON daily_bars(date)
+            '''
+            minute_index_sql = '''
+                CREATE INDEX IF NOT EXISTS idx_minute_bars_timestamp ON minute_bars(timestamp)
+            '''
+
+        self.execute(daily_bars_sql)
+        self.execute(minute_bars_sql)
+        self.execute(sync_log_sql)
+        self.execute(daily_index_sql)
+        self.execute(minute_index_sql)
+
+        logger.info("Market data tables created")
+
     def init_account(self, initial_balance: float = 10000.0):
         """Initialize account with starting balance"""
         count = self.execute('SELECT COUNT(*) FROM account', fetch='one')
@@ -595,7 +706,8 @@ if __name__ == '__main__':
                 print(f"[RESET] Deleted database: {db.db_path}")
         else:
             # For PostgreSQL, drop tables individually
-            tables = ['profile_performance', 'profile_runs', 'screener_profiles',
+            tables = ['sync_log', 'minute_bars', 'daily_bars',
+                     'profile_performance', 'profile_runs', 'screener_profiles',
                      'strategy_backtests', 'youtube_strategies',
                      'performance', 'orders', 'positions', 'account']
             for table in tables:
