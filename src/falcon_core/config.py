@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 import logging
 
 logger = logging.getLogger(__name__)
@@ -207,18 +208,41 @@ class FalconConfig:
                         elif value.startswith("'") and value.endswith("'"):
                             value = value[1:-1]
 
-                        # Map environment variable names to config keys
-                        config_key = self._env_to_config_key(key)
-                        if config_key:
-                            self.config[config_key] = self._cast_value(value)
+                        # Handle DATABASE_URL specially
+                        if key == 'DATABASE_URL':
+                            self._parse_database_url(value)
+                        else:
+                            # Map environment variable names to config keys
+                            config_key = self._env_to_config_key(key)
+                            if config_key:
+                                self.config[config_key] = self._cast_value(value)
 
         except Exception as e:
             logger.error(f"Error loading config file {filepath}: {e}")
+
+    def _parse_database_url(self, url: str):
+        """Parse DATABASE_URL into individual db_* config keys.
+
+        Supports: postgresql://user:password@host:port/dbname
+        """
+        try:
+            parsed = urlparse(url)
+            scheme = 'postgresql' if parsed.scheme in ('postgres', 'postgresql') else parsed.scheme
+            self.config['db_type'] = scheme.split('+')[0]  # strip driver suffix
+            self.config['db_host'] = parsed.hostname or 'localhost'
+            self.config['db_port'] = parsed.port or 5432
+            self.config['db_name'] = parsed.path.lstrip('/')
+            self.config['db_user'] = parsed.username or 'falcon'
+            self.config['db_password'] = parsed.password or ''
+        except Exception as e:
+            logger.error(f"Failed to parse DATABASE_URL: {e}")
 
     def _load_from_env(self):
         """Load configuration from environment variables (highest priority)"""
         env_mappings = {
             'FALCON_ENV': 'env',
+            'FALCON_DATA_DIR': 'base_dir',
+            'FALCON_CONFIG_PATH': 'config_path',
             'DB_TYPE': 'db_type',
             'DB_PATH': 'db_path',
             'DB_HOST': 'db_host',
@@ -227,6 +251,7 @@ class FalconConfig:
             'DB_USER': 'db_user',
             'DB_PASSWORD': 'db_password',
             'MASSIVE_API_KEY': 'massive_api_key',
+            'POLYGON_API_KEY': 'massive_api_key',  # alias
             'CLAUDE_API_KEY': 'claude_api_key',
             'OPENAI_API_KEY': 'openai_api_key',
             'PERPLEXITY_API_KEY': 'perplexity_api_key',
@@ -235,6 +260,11 @@ class FalconConfig:
             'FLASK_PORT': 'flask_port',
             'FLASK_DEBUG': 'flask_debug',
         }
+
+        # DATABASE_URL takes precedence over individual DB_* vars
+        database_url = os.getenv('DATABASE_URL')
+        if database_url:
+            self._parse_database_url(database_url)
 
         for env_var, config_key in env_mappings.items():
             value = os.getenv(env_var)
@@ -253,6 +283,7 @@ class FalconConfig:
             'DB_USER': 'db_user',
             'DB_PASSWORD': 'db_password',
             'MASSIVE_API_KEY': 'massive_api_key',
+            'POLYGON_API_KEY': 'massive_api_key',  # alias
             'CLAUDE_API_KEY': 'claude_api_key',
             'OPENAI_API_KEY': 'openai_api_key',
             'PERPLEXITY_API_KEY': 'perplexity_api_key',
@@ -261,6 +292,8 @@ class FalconConfig:
             'FLASK_PORT': 'flask_port',
             'FLASK_DEBUG': 'flask_debug',
             'INITIAL_BALANCE': 'initial_balance',
+            'FALCON_DATA_DIR': 'base_dir',
+            'FALCON_CONFIG_PATH': 'config_path',
         }
 
         return mappings.get(env_key, env_key.lower())

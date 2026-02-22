@@ -9,6 +9,7 @@ import sqlite3
 import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import contextmanager
+from urllib.parse import urlparse
 import logging
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,23 @@ class DatabaseManager:
         logger.info(f"Database manager initialized: {self.db_type}")
 
     def _load_config_from_env(self) -> Dict[str, Any]:
-        """Load database configuration from environment variables"""
+        """Load database configuration from environment variables.
+
+        DATABASE_URL takes precedence over individual DB_* variables.
+        """
+        database_url = os.getenv('DATABASE_URL')
+        if database_url:
+            parsed = urlparse(database_url)
+            scheme = 'postgresql' if parsed.scheme in ('postgres', 'postgresql') else parsed.scheme
+            return {
+                'db_type': scheme.split('+')[0],
+                'db_host': parsed.hostname or 'localhost',
+                'db_port': parsed.port or 5432,
+                'db_name': (parsed.path or '/falcon').lstrip('/'),
+                'db_user': parsed.username or 'falcon',
+                'db_password': parsed.password or '',
+            }
+
         return {
             'db_type': os.getenv('DB_TYPE', 'sqlite'),
             'db_path': os.getenv('DB_PATH', '/var/lib/falcon/paper_trading.db'),
