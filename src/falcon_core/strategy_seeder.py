@@ -16,15 +16,55 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Standard falcon.env locations
+_ENV_FILE_PATHS = [
+    '/etc/falcon/falcon.env',
+    os.path.expanduser('~/.config/falcon/falcon.env'),
+]
+
+
+def _load_falcon_env():
+    """Load falcon.env into os.environ if not already configured."""
+    # Skip if DATABASE_URL is already set (env is already configured)
+    if os.getenv('DATABASE_URL'):
+        return
+
+    for env_path in _ENV_FILE_PATHS:
+        if os.path.exists(env_path):
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(env_path, override=False)
+                logger.info(f"Loaded environment from {env_path}")
+                return
+            except ImportError:
+                # Fallback: parse manually
+                with open(env_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if '=' in line:
+                            key, _, value = line.partition('=')
+                            key = key.strip()
+                            value = value.strip()
+                            if not os.getenv(key):
+                                os.environ[key] = value
+                logger.info(f"Loaded environment from {env_path} (manual parse)")
+                return
+
+    logger.warning("No falcon.env found. Set DATABASE_URL or create /etc/falcon/falcon.env")
+
 
 def get_db():
     """Get database manager instance."""
+    _load_falcon_env()
     from falcon_core.db_manager import get_db_manager
     db = get_db_manager()
     db.init_schema()
@@ -108,6 +148,8 @@ def run_backtests(db) -> Dict[str, Any]:
     """
     from falcon_core.backtesting.strategies import get_available_strategies
 
+    from datetime import timedelta, date as date_type
+
     try:
         from falcon_core.backtesting.data_feed import DataFeed
         from falcon_core.backtesting.engine import SimpleBacktestEngine
@@ -117,8 +159,13 @@ def run_backtests(db) -> Dict[str, Any]:
         return {}
 
     strategies = get_available_strategies()
-    feed = DataFeed()
+    feed = DataFeed(db_manager=db)
     results = {}
+
+    # Default date range: last 30 trading days (~6 weeks calendar)
+    # Each day downloads a full minute-aggs file from flat files, so keep initial seed manageable
+    end_date = date_type.today() - timedelta(days=1)  # Yesterday (data lag)
+    start_date = end_date - timedelta(days=42)  # ~30 trading days
 
     # Get all strategies in backtest status
     rows = db.execute(
@@ -156,6 +203,8 @@ def run_backtests(db) -> Dict[str, Any]:
             try:
                 data = feed.get_historical_data(
                     symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
                     interval=interval,
                     market_hours_only=True,
                 )
@@ -184,11 +233,11 @@ def run_backtests(db) -> Dict[str, Any]:
 
         # Aggregate metrics
         if all_returns:
-            avg_return = sum(all_returns) / len(all_returns)
-            avg_win_rate = sum(all_win_rates) / len(all_win_rates)
-            avg_sharpe = sum(all_sharpes) / len(all_sharpes) if all_sharpes else 0
+            avg_return = float(sum(all_returns) / len(all_returns))
+            avg_win_rate = float(sum(all_win_rates) / len(all_win_rates))
+            avg_sharpe = float(sum(all_sharpes) / len(all_sharpes)) if all_sharpes else 0.0
             # Profit factor approximation from win rate and R/R
-            profit_factor = (avg_win_rate * 2) / (1 - avg_win_rate) if avg_win_rate < 1 else 10.0
+            profit_factor = float((avg_win_rate * 2) / (1 - avg_win_rate)) if avg_win_rate < 1 else 10.0
 
             now = datetime.now().isoformat()
             db.execute(

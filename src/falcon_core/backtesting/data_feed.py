@@ -148,10 +148,12 @@ class DataFeed:
 
         if source == "auto":
             if is_intraday:
-                # For intraday: try Flat Files first (fastest), then Polygon API, then yfinance
+                # For intraday: try Flat Files first (fastest), then Polygon API, then database, then yfinance
                 data = self._try_flatfiles(symbol, start_date, end_date, interval)
                 if data is None or data.empty:
                     data = self._try_polygon(symbol, start_date, end_date, interval)
+                if data is None or data.empty:
+                    data = self._try_database(symbol, start_date, end_date, interval)
                 if data is None or data.empty:
                     data = self._try_yfinance(symbol, start_date, end_date, interval)
             else:
@@ -315,19 +317,21 @@ class DataFeed:
             return None
 
         try:
-            # Determine table based on interval
-            if interval in ["1m", "5m", "15m"]:
+            # Determine table and time column based on interval
+            if interval in ["1m", "5m", "15m", "30m", "1h"]:
                 table = "minute_bars"
+                time_col = "timestamp"
             else:
                 table = "daily_bars"
+                time_col = "date"
 
             query = f"""
-                SELECT date as timestamp, open, high, low, close, volume
+                SELECT {time_col} as timestamp, open, high, low, close, volume
                 FROM {table}
                 WHERE symbol = %s
-                AND date >= %s
-                AND date <= %s
-                ORDER BY date
+                AND {time_col} >= %s
+                AND {time_col} <= %s
+                ORDER BY {time_col}
             """
             result = self.db.execute(
                 query,
@@ -343,7 +347,11 @@ class DataFeed:
             data['timestamp'] = pd.to_datetime(data['timestamp'])
             data = data.set_index('timestamp')
 
-            logger.debug(f"Loaded {len(data)} rows for {symbol} from database")
+            # Resample if minute_bars but requesting coarser interval
+            if table == "minute_bars" and interval != "1m" and not data.empty:
+                data = self._resample_bars(data, interval)
+
+            logger.info(f"Loaded {len(data)} bars for {symbol} from database ({table})")
             return data
 
         except Exception as e:
