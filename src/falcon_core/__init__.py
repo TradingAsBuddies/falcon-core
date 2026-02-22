@@ -33,6 +33,11 @@ def get_data_feed(*args, **kwargs):
     from falcon_core.backtesting.data_feed import DataFeed
     return DataFeed(*args, **kwargs)
 
+def get_data_sync_pipeline(*args, **kwargs):
+    """Factory function for data sync pipeline"""
+    from falcon_core.data_sync import DataSyncPipeline
+    return DataSyncPipeline(*args, **kwargs)
+
 __version__ = "0.2.0"
 __all__ = [
     # Database
@@ -50,4 +55,6 @@ __all__ = [
     "get_backtest_engine",
     "get_optimizer",
     "get_data_feed",
+    # Data Sync
+    "get_data_sync_pipeline",
 ]

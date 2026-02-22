@@ -88,7 +88,7 @@ class FlatFilesClient:
                 "MASSIVE_SECRET_KEY environment variables, or pass them directly."
             )
 
-        self.cache_dir = Path(cache_dir or os.path.expanduser('~/.cache/falcon/flatfiles'))
+        self.cache_dir = Path(cache_dir or os.getenv('FALCON_CACHE_DIR', os.path.expanduser('~/.cache/falcon/flatfiles')))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._client = None
