@@ -186,6 +186,7 @@ class DatabaseManager:
         self._create_youtube_strategy_tables()
         self._create_screener_tables()
         self._create_market_data_tables()
+        self._create_strategy_rotation_tables()
         logger.info("Database schema initialized successfully")
 
     def _create_trading_tables(self):
@@ -625,6 +626,96 @@ class DatabaseManager:
 
         logger.info("Market data tables created")
 
+    def _create_strategy_rotation_tables(self):
+        """Create strategy rotation/roster tables for strategy lifecycle management"""
+
+        if self.db_type == 'sqlite':
+            roster_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_roster (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name TEXT UNIQUE NOT NULL,
+                    status TEXT DEFAULT 'backtest',
+                    promoted_at TEXT,
+                    demoted_at TEXT,
+                    review_notes TEXT,
+                    symbols TEXT DEFAULT '[]',
+                    interval TEXT DEFAULT '5m',
+                    params TEXT DEFAULT '{}',
+                    last_backtest_at TEXT,
+                    backtest_sharpe REAL,
+                    backtest_win_rate REAL,
+                    backtest_profit_factor REAL,
+                    backtest_total_return REAL,
+                    paper_sharpe REAL,
+                    paper_win_rate REAL,
+                    paper_profit_factor REAL,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+            '''
+            rotation_log_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_rotation_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name TEXT NOT NULL,
+                    from_status TEXT,
+                    to_status TEXT NOT NULL,
+                    reason TEXT,
+                    metrics TEXT,
+                    rotated_at TEXT DEFAULT (datetime('now'))
+                )
+            '''
+        else:  # postgresql
+            roster_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_roster (
+                    id SERIAL PRIMARY KEY,
+                    strategy_name VARCHAR(50) UNIQUE NOT NULL,
+                    status VARCHAR(20) DEFAULT 'backtest',
+                    promoted_at TIMESTAMP,
+                    demoted_at TIMESTAMP,
+                    review_notes TEXT,
+                    symbols JSONB DEFAULT '[]',
+                    interval VARCHAR(10) DEFAULT '5m',
+                    params JSONB DEFAULT '{}',
+                    last_backtest_at TIMESTAMP,
+                    backtest_sharpe DECIMAL(10,4),
+                    backtest_win_rate DECIMAL(5,4),
+                    backtest_profit_factor DECIMAL(10,4),
+                    backtest_total_return DECIMAL(10,4),
+                    paper_sharpe DECIMAL(10,4),
+                    paper_win_rate DECIMAL(5,4),
+                    paper_profit_factor DECIMAL(10,4),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            '''
+            rotation_log_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_rotation_log (
+                    id SERIAL PRIMARY KEY,
+                    strategy_name VARCHAR(50) NOT NULL,
+                    from_status VARCHAR(20),
+                    to_status VARCHAR(20) NOT NULL,
+                    reason TEXT,
+                    metrics JSONB,
+                    rotated_at TIMESTAMP DEFAULT NOW()
+                )
+            '''
+
+        roster_index_sql = '''
+            CREATE INDEX IF NOT EXISTS idx_strategy_roster_status
+            ON strategy_roster(status)
+        '''
+        rotation_log_index_sql = '''
+            CREATE INDEX IF NOT EXISTS idx_rotation_log_strategy
+            ON strategy_rotation_log(strategy_name)
+        '''
+
+        self.execute(roster_sql)
+        self.execute(rotation_log_sql)
+        self.execute(roster_index_sql)
+        self.execute(rotation_log_index_sql)
+
+        logger.info("Strategy rotation tables created")
+
     def init_account(self, initial_balance: float = 10000.0):
         """Initialize account with starting balance"""
         count = self.execute('SELECT COUNT(*) FROM account', fetch='one')
@@ -706,7 +797,8 @@ if __name__ == '__main__':
                 print(f"[RESET] Deleted database: {db.db_path}")
         else:
             # For PostgreSQL, drop tables individually
-            tables = ['sync_log', 'minute_bars', 'daily_bars',
+            tables = ['strategy_rotation_log', 'strategy_roster',
+                     'sync_log', 'minute_bars', 'daily_bars',
                      'profile_performance', 'profile_runs', 'screener_profiles',
                      'strategy_backtests', 'youtube_strategies',
                      'performance', 'orders', 'positions', 'account']

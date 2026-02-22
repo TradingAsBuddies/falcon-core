@@ -142,6 +142,42 @@ class FeedbackLoopScheduler:
                     'interval': '1m',
                     'params': {},
                 },
+                'vwap_bounce': {
+                    'enabled': True,
+                    'symbols': ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA'],
+                    'interval': '5m',
+                    'params': {},
+                },
+                'opening_range_breakout': {
+                    'enabled': True,
+                    'symbols': ['AMD', 'TSLA', 'NVDA', 'META'],
+                    'interval': '5m',
+                    'params': {},
+                },
+                'red_to_green': {
+                    'enabled': True,
+                    'symbols': ['AMD', 'NVDA', 'TSLA'],
+                    'interval': '1m',
+                    'params': {},
+                },
+                'volatility_squeeze': {
+                    'enabled': True,
+                    'symbols': ['SPY', 'QQQ', 'IWM', 'AAPL'],
+                    'interval': '5m',
+                    'params': {},
+                },
+                'microstructure_momentum': {
+                    'enabled': True,
+                    'symbols': ['SPY', 'QQQ', 'AMD'],
+                    'interval': '1m',
+                    'params': {},
+                },
+                'gap_fill_fade': {
+                    'enabled': True,
+                    'symbols': ['TSLA', 'NVDA', 'AMD', 'META'],
+                    'interval': '5m',
+                    'params': {},
+                },
             }
             self._save_config()
 
@@ -165,17 +201,12 @@ class FeedbackLoopScheduler:
 
     def _load_strategy(self, strategy_name: str):
         """Load a strategy class by name"""
-        if strategy_name == 'atr_breakout':
-            from falcon_core.backtesting.strategies.atr_breakout import ATRBreakoutStrategy
-            return ATRBreakoutStrategy
-        elif strategy_name == 'market_memory':
-            from falcon_core.backtesting.strategies.market_memory import MarketMemoryStrategy
-            return MarketMemoryStrategy
-        elif strategy_name == 'one_candle_rule':
-            from falcon_core.backtesting.strategies.one_candle_rule import OneCandleRuleStrategy
-            return OneCandleRuleStrategy
-        else:
-            raise ValueError(f"Unknown strategy: {strategy_name}")
+        from falcon_core.backtesting.strategies import get_available_strategies
+
+        strategies = get_available_strategies()
+        if strategy_name in strategies:
+            return strategies[strategy_name]
+        raise ValueError(f"Unknown strategy: {strategy_name}")
 
     def run_feedback_loop(self, trading_date: Optional[date] = None) -> Dict[str, Any]:
         """

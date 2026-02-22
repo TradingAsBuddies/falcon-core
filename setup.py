@@ -43,6 +43,7 @@ setup(
         "console_scripts": [
             "falcon-backtest=falcon_core.backtesting.cli:main",
             "falcon-data-sync=falcon_core.data_sync_cli:main",
+            "falcon-strategy-seed=falcon_core.strategy_seeder:main",
         ],
     },
     classifiers=[
