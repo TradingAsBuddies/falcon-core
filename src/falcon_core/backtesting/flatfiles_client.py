@@ -120,9 +120,13 @@ class FlatFilesClient:
             f"{trading_date.strftime('%Y-%m-%d')}.csv.gz"
         )
 
-    def _get_day_aggs_key(self, year: int, month: int) -> str:
+    def _get_day_aggs_key(self, trading_date: date) -> str:
         """Get S3 key for daily aggregates file."""
-        return f"{self.DAY_AGGS_PATH}/{year}/{year}-{month:02d}.csv.gz"
+        return (
+            f"{self.DAY_AGGS_PATH}/"
+            f"{trading_date.year}/{trading_date.month:02d}/"
+            f"{trading_date.strftime('%Y-%m-%d')}.csv.gz"
+        )
 
     def _get_cache_path(self, s3_key: str) -> Path:
         """Get local cache path for an S3 key."""
@@ -209,9 +213,10 @@ class FlatFilesClient:
             logger.warning(f"No data for {symbol} on {trading_date}")
             return df
 
-        # Standardize column names
+        # Standardize column names (handles both short and long forms)
         column_map = {
             'window_start': 'timestamp',
+            'transactions': 'trades',
             'o': 'open',
             'h': 'high',
             'l': 'low',
@@ -222,9 +227,13 @@ class FlatFilesClient:
         }
         df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
 
-        # Convert timestamp
+        # Convert timestamp — may be nanosecond epoch or ISO string
         if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            raw = df['timestamp']
+            if pd.api.types.is_numeric_dtype(raw):
+                df['timestamp'] = pd.to_datetime(raw, unit='ns')
+            else:
+                df['timestamp'] = pd.to_datetime(raw)
             df = df.set_index('timestamp')
         elif 'window_start' in df.columns:
             df['timestamp'] = pd.to_datetime(df['window_start'])
@@ -265,28 +274,24 @@ class FlatFilesClient:
         elif isinstance(end_date, datetime):
             end_date = end_date.date()
 
-        # Collect data from each month file
+        # Collect data from each daily file
         all_data = []
 
-        current = date(start_date.year, start_date.month, 1)
-        end_month = date(end_date.year, end_date.month, 1)
+        current = start_date
+        while current <= end_date:
+            # Skip weekends
+            if current.weekday() < 5:
+                s3_key = self._get_day_aggs_key(current)
+                df = self._download_file(s3_key, use_cache)
 
-        while current <= end_month:
-            s3_key = self._get_day_aggs_key(current.year, current.month)
-            df = self._download_file(s3_key, use_cache)
+                if not df.empty:
+                    # Filter for symbol
+                    ticker_col = 'ticker' if 'ticker' in df.columns else 'symbol'
+                    day_data = df[df[ticker_col] == symbol.upper()].copy()
+                    if not day_data.empty:
+                        all_data.append(day_data)
 
-            if not df.empty:
-                # Filter for symbol
-                ticker_col = 'ticker' if 'ticker' in df.columns else 'symbol'
-                month_data = df[df[ticker_col] == symbol.upper()].copy()
-                if not month_data.empty:
-                    all_data.append(month_data)
-
-            # Next month
-            if current.month == 12:
-                current = date(current.year + 1, 1, 1)
-            else:
-                current = date(current.year, current.month + 1, 1)
+            current += pd.Timedelta(days=1).to_pytimedelta()
 
         if not all_data:
             logger.warning(f"No daily data for {symbol}")
@@ -294,9 +299,10 @@ class FlatFilesClient:
 
         df = pd.concat(all_data, ignore_index=True)
 
-        # Standardize columns
+        # Standardize columns (handles both short and long forms)
         column_map = {
             'window_start': 'date',
+            'transactions': 'trades',
             'o': 'open',
             'h': 'high',
             'l': 'low',
@@ -307,9 +313,13 @@ class FlatFilesClient:
         }
         df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
 
-        # Convert date
+        # Convert date — may be nanosecond epoch or ISO string
         date_col = 'date' if 'date' in df.columns else 'window_start'
-        df['date'] = pd.to_datetime(df[date_col]).dt.date
+        raw = df[date_col]
+        if pd.api.types.is_numeric_dtype(raw):
+            df['date'] = pd.to_datetime(raw, unit='ns').dt.date
+        else:
+            df['date'] = pd.to_datetime(raw).dt.date
         df = df.set_index('date')
 
         # Filter date range

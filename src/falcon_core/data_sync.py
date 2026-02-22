@@ -22,9 +22,13 @@ class DataSyncPipeline:
     """Pipeline to sync Polygon flat files into PostgreSQL."""
 
     # Column mapping from flat file format to database columns
+    # Flat files use full names (ticker, open, close, volume, transactions)
+    # and short names (o, h, l, c, v, vw, n) depending on the file version
     COLUMN_MAP = {
         'ticker': 'symbol',
         'window_start': 'date',
+        'transactions': 'trades',
+        # v1 short-form aliases
         'o': 'open',
         'h': 'high',
         'l': 'low',
@@ -35,9 +39,11 @@ class DataSyncPipeline:
     }
 
     DAILY_COLUMNS = ['symbol', 'date', 'open', 'high', 'low', 'close',
-                     'volume', 'vwap', 'trades']
+                     'volume', 'trades']
+    DAILY_COLUMNS_OPTIONAL = ['vwap']
     MINUTE_COLUMNS = ['symbol', 'timestamp', 'open', 'high', 'low', 'close',
-                      'volume', 'vwap', 'trades']
+                      'volume', 'trades']
+    MINUTE_COLUMNS_OPTIONAL = ['vwap']
 
     def __init__(self, db, flat_client):
         """
@@ -55,7 +61,7 @@ class DataSyncPipeline:
         """
         Sync daily bars for a single date.
 
-        Downloads the monthly file containing target_date, filters to that date,
+        Downloads the per-day flat file for target_date (all symbols)
         and bulk-loads into daily_bars via COPY + upsert.
 
         Args:
@@ -73,34 +79,37 @@ class DataSyncPipeline:
                     'duration_seconds': 0, 'status': 'skipped'}
 
         start_time = time.time()
-        s3_key = self.flat_client._get_day_aggs_key(target_date.year, target_date.month)
+        s3_key = self.flat_client._get_day_aggs_key(target_date)
 
         try:
-            # Current month's file may still be accumulating — skip cache
-            today = date.today()
-            use_cache = not (target_date.year == today.year and target_date.month == today.month)
+            # Today's file may still be accumulating — skip cache
+            use_cache = target_date < date.today()
 
             df = self.flat_client._download_file(s3_key, use_cache=use_cache)
             if df.empty:
-                logger.warning(f"No data in {s3_key}")
+                logger.info(f"No trading data for {target_date} (weekend/holiday?)")
                 return self._record_sync(sync_type, target_date, s3_key, 0,
                                          time.time() - start_time, 'no_data')
 
             # Standardize columns
             df = df.rename(columns=self.COLUMN_MAP)
 
-            # Parse date and filter to target
+            # Parse date — may be nanosecond epoch or ISO string
             if 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date']).dt.date
-            df = df[df['date'] == target_date]
+                raw = df['date']
+                if pd.api.types.is_numeric_dtype(raw):
+                    df['date'] = pd.to_datetime(raw, unit='ns').dt.date
+                else:
+                    df['date'] = pd.to_datetime(raw).dt.date
 
-            if df.empty:
-                logger.info(f"No trading data for {target_date} (weekend/holiday?)")
-                return self._record_sync(sync_type, target_date, s3_key, 0,
-                                         time.time() - start_time, 'no_data')
+            # Add optional columns if missing (NULL-filled)
+            for col in self.DAILY_COLUMNS_OPTIONAL:
+                if col not in df.columns:
+                    df[col] = None
 
-            # Keep only needed columns, drop rows with missing symbol
-            df = df[self.DAILY_COLUMNS].dropna(subset=['symbol'])
+            # Select columns present in the table
+            use_cols = self.DAILY_COLUMNS + [c for c in self.DAILY_COLUMNS_OPTIONAL if c in df.columns]
+            df = df[use_cols].dropna(subset=['symbol'])
 
             rows = self._bulk_load_daily(df)
             duration = time.time() - start_time
@@ -145,17 +154,27 @@ class DataSyncPipeline:
                 return self._record_sync(sync_type, target_date, s3_key, 0,
                                          time.time() - start_time, 'no_data')
 
-            # Standardize columns
+            # Standardize columns (override date->timestamp for minute data)
             col_map = dict(self.COLUMN_MAP)
             col_map['window_start'] = 'timestamp'
             df = df.rename(columns=col_map)
 
-            # Parse timestamp
+            # Parse timestamp — may be nanosecond epoch or ISO string
             if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                raw = df['timestamp']
+                if pd.api.types.is_numeric_dtype(raw):
+                    df['timestamp'] = pd.to_datetime(raw, unit='ns')
+                else:
+                    df['timestamp'] = pd.to_datetime(raw)
 
-            # Keep only needed columns
-            df = df[self.MINUTE_COLUMNS].dropna(subset=['symbol'])
+            # Add optional columns if missing
+            for col in self.MINUTE_COLUMNS_OPTIONAL:
+                if col not in df.columns:
+                    df[col] = None
+
+            # Select columns present in the table
+            use_cols = self.MINUTE_COLUMNS + [c for c in self.MINUTE_COLUMNS_OPTIONAL if c in df.columns]
+            df = df[use_cols].dropna(subset=['symbol'])
 
             rows = self._bulk_load_minute(df)
             duration = time.time() - start_time
@@ -174,8 +193,7 @@ class DataSyncPipeline:
         """
         Backfill daily bars for a date range.
 
-        Iterates through each trading day in the range, downloading month files
-        as needed and loading all dates from each file.
+        Downloads per-day flat files and loads each into PostgreSQL.
 
         Args:
             start: Start date (inclusive)
@@ -185,19 +203,15 @@ class DataSyncPipeline:
             List of sync result dicts
         """
         results = []
-        # Process month by month for efficiency
-        current_month = date(start.year, start.month, 1)
-        end_month = date(end.year, end.month, 1)
+        current = start
 
-        while current_month <= end_month:
-            month_results = self._backfill_daily_month(current_month, start, end)
-            results.extend(month_results)
+        while current <= end:
+            # Skip weekends
+            if current.weekday() < 5:
+                result = self.sync_daily(current)
+                results.append(result)
 
-            # Next month
-            if current_month.month == 12:
-                current_month = date(current_month.year + 1, 1, 1)
-            else:
-                current_month = date(current_month.year, current_month.month + 1, 1)
+            current += timedelta(days=1)
 
         return results
 
@@ -225,66 +239,18 @@ class DataSyncPipeline:
 
         return results
 
-    def _backfill_daily_month(self, month_start: date, range_start: date,
-                              range_end: date) -> List[Dict[str, Any]]:
-        """Backfill all daily bars from a single month file within the given range."""
-        start_time = time.time()
-        s3_key = self.flat_client._get_day_aggs_key(month_start.year, month_start.month)
-
-        try:
-            today = date.today()
-            use_cache = not (month_start.year == today.year and month_start.month == today.month)
-
-            df = self.flat_client._download_file(s3_key, use_cache=use_cache)
-            if df.empty:
-                logger.warning(f"No data in {s3_key}")
-                return []
-
-            df = df.rename(columns=self.COLUMN_MAP)
-
-            if 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date']).dt.date
-
-            # Filter to requested range
-            df = df[(df['date'] >= range_start) & (df['date'] <= range_end)]
-            if df.empty:
-                return []
-
-            df = df[self.DAILY_COLUMNS].dropna(subset=['symbol'])
-
-            # Group by date and load each day
-            results = []
-            for day, day_df in df.groupby('date'):
-                if self._already_synced('daily', day):
-                    results.append({'date': str(day), 'rows_loaded': 0,
-                                    'duration_seconds': 0, 'status': 'skipped'})
-                    continue
-
-                day_start = time.time()
-                rows = self._bulk_load_daily(day_df)
-                duration = time.time() - day_start
-
-                result = self._record_sync('daily', day, s3_key, rows,
-                                           duration, 'success')
-                results.append(result)
-                logger.info(f"Backfilled {rows} daily bars for {day}")
-
-            return results
-
-        except Exception as e:
-            logger.error(f"Failed to backfill month {month_start}: {e}")
-            return [{'date': str(month_start), 'rows_loaded': 0,
-                     'duration_seconds': time.time() - start_time,
-                     'status': 'error', 'error': str(e)}]
-
     def _bulk_load_daily(self, df: pd.DataFrame) -> int:
         """Bulk load daily bars using COPY + upsert staging table."""
-        return self._bulk_load(df, 'daily_bars', self.DAILY_COLUMNS,
+        columns = [c for c in df.columns if c in
+                   self.DAILY_COLUMNS + self.DAILY_COLUMNS_OPTIONAL]
+        return self._bulk_load(df, 'daily_bars', columns,
                                conflict_cols=['symbol', 'date'])
 
     def _bulk_load_minute(self, df: pd.DataFrame) -> int:
         """Bulk load minute bars using COPY + upsert staging table."""
-        return self._bulk_load(df, 'minute_bars', self.MINUTE_COLUMNS,
+        columns = [c for c in df.columns if c in
+                   self.MINUTE_COLUMNS + self.MINUTE_COLUMNS_OPTIONAL]
+        return self._bulk_load(df, 'minute_bars', columns,
                                conflict_cols=['symbol', 'timestamp'])
 
     def _bulk_load(self, df: pd.DataFrame, table: str, columns: List[str],
@@ -302,8 +268,8 @@ class DataSyncPipeline:
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                # Create staging table
-                cursor.execute(f"CREATE TEMP TABLE _staging (LIKE {table} INCLUDING NOTHING)")
+                # Create staging table (structure only, no constraints/indexes)
+                cursor.execute(f"CREATE TEMP TABLE _staging (LIKE {table})")
 
                 # Write DataFrame to CSV buffer
                 buf = io.StringIO()
