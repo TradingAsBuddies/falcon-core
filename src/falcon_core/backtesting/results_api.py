@@ -169,10 +169,26 @@ class BacktestResultsStore:
 
         conn.commit()
 
+    @staticmethod
+    def _normalize_row(row):
+        """Convert Decimal values to float for JSON serialization."""
+        from decimal import Decimal
+        if row is None:
+            return None
+        return {k: float(v) if isinstance(v, Decimal) else v for k, v in dict(row).items()}
+
     def _execute(self, query, params=None, fetch=None):
         """Execute query using db_manager or standalone SQLite."""
         if self._db_manager is not None:
-            return self._db_manager.execute(query, params, fetch=fetch)
+            # db_manager.execute expects fetch='none' (string) for write ops
+            db_fetch = fetch if fetch in ('one', 'all') else 'none'
+            result = self._db_manager.execute(query, params, fetch=db_fetch)
+            # Normalize Decimal types from PostgreSQL
+            if db_fetch == 'one' and result:
+                return self._normalize_row(result)
+            elif db_fetch == 'all' and result:
+                return [self._normalize_row(row) for row in result]
+            return result
         else:
             conn = self._get_standalone_connection()
             cursor = conn.cursor()
