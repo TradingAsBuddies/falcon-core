@@ -218,13 +218,13 @@ class BacktestResultsStore:
             record.symbol,
             record.trading_date.isoformat() if record.trading_date else None,
             record.interval,
-            record.total_return,
-            record.max_drawdown,
-            record.sharpe_ratio,
-            record.win_rate,
-            record.total_trades,
-            record.signals_count,
-            json.dumps(record.parameters) if record.parameters else None,
+            float(record.total_return),
+            float(record.max_drawdown),
+            float(record.sharpe_ratio),
+            float(record.win_rate),
+            int(record.total_trades),
+            int(record.signals_count),
+            json.dumps(record.parameters, default=float) if record.parameters else None,
         ))
         return result if isinstance(result, int) else 0
 
