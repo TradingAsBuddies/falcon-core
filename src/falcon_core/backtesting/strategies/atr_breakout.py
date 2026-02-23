@@ -58,13 +58,19 @@ class ATRBreakoutParams(StrategyParams):
     # Entry conditions
     min_volume_multiplier: float = 10.0  # Volume must be 10x shares purchased
     min_gap_pct: float = 0.03  # 3% minimum gap for "gapper" qualification
-    min_relative_volume: float = 2.0  # Relative volume vs 20-bar average
+    min_relative_volume: float = 2.5  # Relative volume vs 20-bar average
 
     # Position sizing
     position_size: float = 25000.0  # Default $25K position
 
     # Trailing stop
-    atr_multiplier: float = 1.0  # Multiply ATR by this for stop distance
+    atr_multiplier: float = 1.5  # Multiply ATR by this for stop distance
+
+    # Re-entry cooldown
+    min_bars_between_trades: int = 6  # ~30 min cooldown after exit
+
+    # Breakout quality filter
+    min_breakout_body_pct: float = 0.5  # Breakout candle body must be >50% of range
 
     # Time filter
     trade_start_time: str = "09:35"  # 5 min after open
@@ -170,14 +176,40 @@ class ATRBreakoutStrategy(BaseStrategy):
         if len(data) < min_bars:
             return signals
 
+        # Detect day boundaries for EOD exits and cooldown resets
+        has_dates = isinstance(data.index, pd.DatetimeIndex)
+        prev_date = data.index[min_bars].date() if has_dates else None
+
         # Track state
         in_position = False
         entry_price = None
         trailing_stop = None
+        last_exit_bar = -params.min_bars_between_trades
 
         for i in range(min_bars, len(data)):
             candle = data.iloc[i]
             timestamp = data.index[i]
+            current_date = timestamp.date() if has_dates else None
+
+            # Day boundary detection — force close and reset cooldown
+            if has_dates and current_date != prev_date:
+                if in_position:
+                    # Force close at previous day's last bar
+                    prev_day_last = data.iloc[i - 1]
+                    signals.append(Signal(
+                        timestamp=data.index[i - 1],
+                        signal_type=SignalType.EXIT_LONG,
+                        price=prev_day_last['close'],
+                        symbol="",
+                        confidence=0.5,
+                        reason="End of day — closing ATR breakout position",
+                    ))
+                    in_position = False
+                    entry_price = None
+                    trailing_stop = None
+                # Reset cooldown at start of new day
+                last_exit_bar = -params.min_bars_between_trades
+                prev_date = current_date
 
             cyan_line = candle['cyan_line']
             atr = candle['atr']
@@ -209,6 +241,11 @@ class ATRBreakoutStrategy(BaseStrategy):
                     in_position = False
                     entry_price = None
                     trailing_stop = None
+                    last_exit_bar = i
+                continue
+
+            # Re-entry cooldown after exit
+            if i - last_exit_bar < params.min_bars_between_trades:
                 continue
 
             # Entry conditions
@@ -227,6 +264,12 @@ class ATRBreakoutStrategy(BaseStrategy):
                 if not pd.isna(prev_cyan) and prev_candle['close'] > prev_cyan:
                     # Already above cyan line - not a fresh breakout
                     continue
+
+            # 4. Breakout candle body must be >50% of range (not a doji)
+            candle_range = candle['high'] - candle['low']
+            candle_body = abs(candle['close'] - candle['open'])
+            if candle_range > 0 and candle_body / candle_range < params.min_breakout_body_pct:
+                continue
 
             # Entry signal
             initial_stop = cyan_line

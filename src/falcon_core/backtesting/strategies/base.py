@@ -235,12 +235,21 @@ class BaseStrategy(ABC):
         Validate a signal before emission.
 
         Override to add custom validation logic.
-        Default: check position limits and basic filters.
+        Default: check position limits, trading hours, and basic filters.
         """
         # Check position limits
         if signal.signal_type in [SignalType.LONG, SignalType.SHORT]:
             if current_positions >= self.params.max_positions:
                 return False
+
+        # Check trading hours (only block new entries, allow exits through)
+        if isinstance(signal.timestamp, datetime):
+            signal_time = signal.timestamp.time()
+            start = datetime.strptime(self.params.trade_start_time, "%H:%M").time()
+            end = datetime.strptime(self.params.trade_end_time, "%H:%M").time()
+            if signal.signal_type in [SignalType.LONG, SignalType.SHORT]:
+                if signal_time < start or signal_time > end:
+                    return False
 
         # Check price filters
         if signal.price < self.params.min_price:
@@ -287,9 +296,9 @@ class BaseStrategy(ABC):
                 validated_signals.append(signal)
 
                 # Track position count
-                if signal.signal_type == SignalType.LONG:
+                if signal.signal_type in [SignalType.LONG, SignalType.SHORT]:
                     current_positions += 1
-                elif signal.signal_type == SignalType.EXIT_LONG:
+                elif signal.signal_type in [SignalType.EXIT_LONG, SignalType.EXIT_SHORT]:
                     current_positions = max(0, current_positions - 1)
 
         self._signals = validated_signals

@@ -43,11 +43,11 @@ class OpeningRangeBreakoutParams(StrategyParams):
 
     # Opening range
     orb_minutes: int = 15  # First 15 minutes define the range
-    breakout_buffer: float = 0.001  # 0.1% buffer above/below range
+    breakout_buffer: float = 0.002  # 0.2% buffer above/below range
 
     # Breakout confirmation
-    stop_at_opposite: bool = True  # Stop at opposite side of range
-    min_breakout_volume: float = 1.3  # Volume must be 1.3x average
+    stop_at_opposite: bool = False  # Use ATR-based stop instead (better R/R)
+    min_breakout_volume: float = 1.8  # Volume must be 1.8x average
 
     # Risk management
     risk_reward_ratio: float = 2.0
@@ -56,7 +56,7 @@ class OpeningRangeBreakoutParams(StrategyParams):
 
     # Range filters
     min_range_pct: float = 0.003  # Range must be at least 0.3% (not too tight)
-    max_range_pct: float = 0.03  # Range must be at most 3% (not too wide)
+    max_range_pct: float = 0.05  # Range must be at most 5% (allow wider on gappers)
 
     # Time filter
     trade_start_time: str = "09:45"  # After ORB is established
@@ -145,159 +145,205 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         signals = []
         params = self.params
 
-        orb = self._calculate_opening_range(data)
-        if orb is None:
+        if not isinstance(data.index, pd.DatetimeIndex):
             return signals
 
-        range_high = orb['high']
-        range_low = orb['low']
-        buffer_high = range_high * (1 + params.breakout_buffer)
-        buffer_low = range_low * (1 - params.breakout_buffer)
+        # Process each trading day independently
+        dates = data.index.date
+        unique_dates = sorted(set(dates))
 
-        in_position = False
-        position_direction = None  # 'long' or 'short'
-        entry_price = None
-        stop_loss = None
-        take_profit = None
+        for today in unique_dates:
+            day_data = data[dates == today]
+            if len(day_data) < 3:
+                continue
 
-        # Start scanning after the opening range is established
-        for i in range(orb['bars'], len(data)):
-            candle = data.iloc[i]
-            timestamp = data.index[i]
+            # Calculate fresh ORB for this day
+            orb = self._calculate_opening_range(day_data)
+            if orb is None:
+                continue
 
-            # Exit logic
-            if in_position:
-                if position_direction == 'long':
-                    if candle['low'] <= stop_loss:
+            range_high = orb['high']
+            range_low = orb['low']
+            buffer_high = range_high * (1 + params.breakout_buffer)
+            buffer_low = range_low * (1 - params.breakout_buffer)
+
+            # Reset all state for each new day (ORB is a day-trade strategy)
+            in_position = False
+            position_direction = None
+            entry_price = None
+            stop_loss = None
+            take_profit = None
+            pending_breakout = None
+
+            # Start scanning after the opening range is established
+            for i in range(orb['bars'], len(day_data)):
+                candle = day_data.iloc[i]
+                timestamp = day_data.index[i]
+
+                # Force close at end of day
+                if i == len(day_data) - 1 and in_position:
+                    exit_type = SignalType.EXIT_LONG if position_direction == 'long' else SignalType.EXIT_SHORT
+                    signals.append(Signal(
+                        timestamp=timestamp,
+                        signal_type=exit_type,
+                        price=candle['close'],
+                        symbol="",
+                        confidence=0.5,
+                        reason="End of day — closing ORB position",
+                    ))
+                    in_position = False
+                    break
+
+                # Exit logic
+                if in_position:
+                    if position_direction == 'long':
+                        if candle['low'] <= stop_loss:
+                            signals.append(Signal(
+                                timestamp=timestamp,
+                                signal_type=SignalType.EXIT_LONG,
+                                price=stop_loss,
+                                symbol="",
+                                confidence=1.0,
+                                reason="Stop loss triggered",
+                            ))
+                            in_position = False
+                            continue
+
+                        if candle['high'] >= take_profit:
+                            signals.append(Signal(
+                                timestamp=timestamp,
+                                signal_type=SignalType.EXIT_LONG,
+                                price=take_profit,
+                                symbol="",
+                                confidence=1.0,
+                                reason="Take profit hit",
+                            ))
+                            in_position = False
+                            continue
+                    elif position_direction == 'short':
+                        if candle['high'] >= stop_loss:
+                            signals.append(Signal(
+                                timestamp=timestamp,
+                                signal_type=SignalType.EXIT_SHORT,
+                                price=stop_loss,
+                                symbol="",
+                                confidence=1.0,
+                                reason="Stop loss triggered",
+                            ))
+                            in_position = False
+                            continue
+
+                        if candle['low'] <= take_profit:
+                            signals.append(Signal(
+                                timestamp=timestamp,
+                                signal_type=SignalType.EXIT_SHORT,
+                                price=take_profit,
+                                symbol="",
+                                confidence=1.0,
+                                reason="Take profit hit",
+                            ))
+                            in_position = False
+                            continue
+
+                    continue  # Still in position, skip entry logic
+
+                # Follow-through check: confirm breakout bar holds on next bar
+                if pending_breakout is not None:
+                    direction = pending_breakout['direction']
+                    if direction == 'long' and candle['close'] > range_high:
+                        vol_ratio = pending_breakout['vol_ratio']
+
+                        if params.stop_at_opposite:
+                            stop = range_low
+                        else:
+                            stop = candle['close'] * (1 - params.default_stop_loss_pct)
+
+                        risk = candle['close'] - stop
+                        target = candle['close'] + risk * params.risk_reward_ratio
+
+                        confidence = min(1.0, 0.5 + min(vol_ratio / 5, 0.3) + orb['range_pct'] * 5)
+
                         signals.append(Signal(
                             timestamp=timestamp,
-                            signal_type=SignalType.EXIT_LONG,
-                            price=stop_loss,
+                            signal_type=SignalType.LONG,
+                            price=candle['close'],
                             symbol="",
-                            confidence=1.0,
-                            reason="Stop loss triggered",
+                            confidence=confidence,
+                            stop_loss=stop,
+                            take_profit=target,
+                            position_size=params.position_size,
+                            reason=f"ORB breakout long (confirmed): range {orb['range_pct']:.2%}, vol {vol_ratio:.1f}x",
+                            metadata={
+                                'range_high': range_high,
+                                'range_low': range_low,
+                                'range_pct': orb['range_pct'],
+                                'volume_ratio': vol_ratio,
+                                'direction': 'long',
+                            },
                         ))
-                        in_position = False
-                        continue
 
-                    if candle['high'] >= take_profit:
+                        in_position = True
+                        position_direction = 'long'
+                        entry_price = candle['close']
+                        stop_loss = stop
+                        take_profit = target
+
+                    elif direction == 'short' and candle['close'] < range_low:
+                        vol_ratio = pending_breakout['vol_ratio']
+
+                        if params.stop_at_opposite:
+                            stop = range_high
+                        else:
+                            stop = candle['close'] * (1 + params.default_stop_loss_pct)
+
+                        risk = stop - candle['close']
+                        target = candle['close'] - risk * params.risk_reward_ratio
+
+                        confidence = min(1.0, 0.5 + min(vol_ratio / 5, 0.3) + orb['range_pct'] * 5)
+
                         signals.append(Signal(
                             timestamp=timestamp,
-                            signal_type=SignalType.EXIT_LONG,
-                            price=take_profit,
+                            signal_type=SignalType.SHORT,
+                            price=candle['close'],
                             symbol="",
-                            confidence=1.0,
-                            reason="Take profit hit",
+                            confidence=confidence,
+                            stop_loss=stop,
+                            take_profit=target,
+                            position_size=params.position_size,
+                            reason=f"ORB breakout short (confirmed): range {orb['range_pct']:.2%}, vol {vol_ratio:.1f}x",
+                            metadata={
+                                'range_high': range_high,
+                                'range_low': range_low,
+                                'range_pct': orb['range_pct'],
+                                'volume_ratio': vol_ratio,
+                                'direction': 'short',
+                            },
                         ))
-                        in_position = False
-                        continue
-                elif position_direction == 'short':
-                    if candle['high'] >= stop_loss:
-                        signals.append(Signal(
-                            timestamp=timestamp,
-                            signal_type=SignalType.EXIT_SHORT,
-                            price=stop_loss,
-                            symbol="",
-                            confidence=1.0,
-                            reason="Stop loss triggered",
-                        ))
-                        in_position = False
-                        continue
 
-                    if candle['low'] <= take_profit:
-                        signals.append(Signal(
-                            timestamp=timestamp,
-                            signal_type=SignalType.EXIT_SHORT,
-                            price=take_profit,
-                            symbol="",
-                            confidence=1.0,
-                            reason="Take profit hit",
-                        ))
-                        in_position = False
-                        continue
+                        in_position = True
+                        position_direction = 'short'
+                        entry_price = candle['close']
+                        stop_loss = stop
+                        take_profit = target
 
-                continue  # Still in position, skip entry logic
-
-            # Breakout above range high — LONG
-            if candle['close'] > buffer_high:
-                vol_ratio = candle.get('volume_ratio', 0)
-                if vol_ratio < params.min_breakout_volume:
+                    # Clear pending regardless of outcome
+                    pending_breakout = None
                     continue
 
-                if params.stop_at_opposite:
-                    stop = range_low
-                else:
-                    stop = candle['close'] * (1 - params.default_stop_loss_pct)
+                # Breakout above range high — queue for follow-through
+                if candle['close'] > buffer_high:
+                    vol_ratio = candle.get('volume_ratio', 0)
+                    if vol_ratio < params.min_breakout_volume:
+                        continue
 
-                risk = candle['close'] - stop
-                target = candle['close'] + risk * params.risk_reward_ratio
+                    pending_breakout = {'direction': 'long', 'vol_ratio': vol_ratio}
 
-                confidence = min(1.0, 0.5 + min(vol_ratio / 5, 0.3) + orb['range_pct'] * 5)
+                # Breakout below range low — queue for follow-through
+                elif candle['close'] < buffer_low:
+                    vol_ratio = candle.get('volume_ratio', 0)
+                    if vol_ratio < params.min_breakout_volume:
+                        continue
 
-                signals.append(Signal(
-                    timestamp=timestamp,
-                    signal_type=SignalType.LONG,
-                    price=candle['close'],
-                    symbol="",
-                    confidence=confidence,
-                    stop_loss=stop,
-                    take_profit=target,
-                    position_size=params.position_size,
-                    reason=f"ORB breakout long: range {orb['range_pct']:.2%}, vol {vol_ratio:.1f}x",
-                    metadata={
-                        'range_high': range_high,
-                        'range_low': range_low,
-                        'range_pct': orb['range_pct'],
-                        'volume_ratio': vol_ratio,
-                        'direction': 'long',
-                    },
-                ))
-
-                in_position = True
-                position_direction = 'long'
-                entry_price = candle['close']
-                stop_loss = stop
-                take_profit = target
-
-            # Breakout below range low — SHORT
-            elif candle['close'] < buffer_low:
-                vol_ratio = candle.get('volume_ratio', 0)
-                if vol_ratio < params.min_breakout_volume:
-                    continue
-
-                if params.stop_at_opposite:
-                    stop = range_high
-                else:
-                    stop = candle['close'] * (1 + params.default_stop_loss_pct)
-
-                risk = stop - candle['close']
-                target = candle['close'] - risk * params.risk_reward_ratio
-
-                confidence = min(1.0, 0.5 + min(vol_ratio / 5, 0.3) + orb['range_pct'] * 5)
-
-                signals.append(Signal(
-                    timestamp=timestamp,
-                    signal_type=SignalType.SHORT,
-                    price=candle['close'],
-                    symbol="",
-                    confidence=confidence,
-                    stop_loss=stop,
-                    take_profit=target,
-                    position_size=params.position_size,
-                    reason=f"ORB breakout short: range {orb['range_pct']:.2%}, vol {vol_ratio:.1f}x",
-                    metadata={
-                        'range_high': range_high,
-                        'range_low': range_low,
-                        'range_pct': orb['range_pct'],
-                        'volume_ratio': vol_ratio,
-                        'direction': 'short',
-                    },
-                ))
-
-                in_position = True
-                position_direction = 'short'
-                entry_price = candle['close']
-                stop_loss = stop
-                take_profit = target
+                    pending_breakout = {'direction': 'short', 'vol_ratio': vol_ratio}
 
         return signals

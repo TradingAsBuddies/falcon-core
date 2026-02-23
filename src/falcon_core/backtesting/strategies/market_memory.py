@@ -59,16 +59,16 @@ class MarketMemoryParams(StrategyParams):
     recommended_interval: str = "5m"
 
     # Day 1 move qualification
-    min_day1_move_pct: float = 0.05  # 5% minimum move on Day 1
+    min_day1_move_pct: float = 0.02  # 2% minimum move on Day 1
     min_day1_volume_mult: float = 1.5  # 1.5x average volume on Day 1
 
     # Key level zones
-    zone_tolerance: float = 0.003  # 0.3% tolerance for level zones (tighter for intraday)
+    zone_tolerance: float = 0.008  # 0.8% tolerance for level zones
     range_middle_pct: float = 0.3  # Avoid middle 30% of range
 
     # John Wick candle detection
-    min_wick_pct: float = 0.6  # Wick must be 60% of candle range
-    max_body_pct: float = 0.3  # Body must be <30% of range
+    min_wick_pct: float = 0.4  # Wick must be 40% of candle range
+    max_body_pct: float = 0.45  # Body must be <45% of range
     min_candle_range_atr: float = 0.5  # Min candle range as % of ATR
 
     # Trade management
@@ -301,38 +301,73 @@ class MarketMemoryStrategy(BaseStrategy):
             for i, (timestamp, candle) in enumerate(today_data.iterrows()):
                 # Manage existing position
                 if in_position:
-                    # Check stop loss
-                    if position_type == 'long' and candle['low'] <= stop_loss:
-                        signals.append(Signal(
-                            timestamp=timestamp,
-                            signal_type=SignalType.EXIT_LONG,
-                            price=stop_loss,
-                            symbol="",
-                            confidence=1.0,
-                            reason="Stop loss hit",
-                        ))
-                        in_position = False
-                        continue
+                    if position_type == 'long':
+                        # Check stop loss
+                        if candle['low'] <= stop_loss:
+                            signals.append(Signal(
+                                timestamp=timestamp,
+                                signal_type=SignalType.EXIT_LONG,
+                                price=stop_loss,
+                                symbol="",
+                                confidence=1.0,
+                                reason="Stop loss hit",
+                            ))
+                            in_position = False
+                            continue
 
-                    # Check take profit
-                    if position_type == 'long' and candle['high'] >= target_price:
-                        signals.append(Signal(
-                            timestamp=timestamp,
-                            signal_type=SignalType.EXIT_LONG,
-                            price=target_price,
-                            symbol="",
-                            confidence=1.0,
-                            reason="Target reached (opposite side of range)",
-                        ))
-                        in_position = False
-                        continue
+                        # Check take profit
+                        if candle['high'] >= target_price:
+                            signals.append(Signal(
+                                timestamp=timestamp,
+                                signal_type=SignalType.EXIT_LONG,
+                                price=target_price,
+                                symbol="",
+                                confidence=1.0,
+                                reason="Target reached (opposite side of range)",
+                            ))
+                            in_position = False
+                            continue
 
-                    # Move stop to breakeven
-                    if not breakeven_moved and position_type == 'long':
-                        profit_pct = (candle['close'] - entry_price) / entry_price
-                        if profit_pct >= params.breakeven_trigger_pct:
-                            stop_loss = entry_price
-                            breakeven_moved = True
+                        # Move stop to breakeven
+                        if not breakeven_moved:
+                            profit_pct = (candle['close'] - entry_price) / entry_price
+                            if profit_pct >= params.breakeven_trigger_pct:
+                                stop_loss = entry_price
+                                breakeven_moved = True
+
+                    elif position_type == 'short':
+                        # Check stop loss (price goes up)
+                        if candle['high'] >= stop_loss:
+                            signals.append(Signal(
+                                timestamp=timestamp,
+                                signal_type=SignalType.EXIT_SHORT,
+                                price=stop_loss,
+                                symbol="",
+                                confidence=1.0,
+                                reason="Stop loss hit",
+                            ))
+                            in_position = False
+                            continue
+
+                        # Check take profit (price goes down)
+                        if candle['low'] <= target_price:
+                            signals.append(Signal(
+                                timestamp=timestamp,
+                                signal_type=SignalType.EXIT_SHORT,
+                                price=target_price,
+                                symbol="",
+                                confidence=1.0,
+                                reason="Target reached (opposite side of range)",
+                            ))
+                            in_position = False
+                            continue
+
+                        # Move stop to breakeven
+                        if not breakeven_moved:
+                            profit_pct = (entry_price - candle['close']) / entry_price
+                            if profit_pct >= params.breakeven_trigger_pct:
+                                stop_loss = entry_price
+                                breakeven_moved = True
 
                     continue
 
@@ -343,8 +378,11 @@ class MarketMemoryStrategy(BaseStrategy):
                 # LONG SETUP: Price near yesterday's low with John Wick up
                 if self._is_near_level(candle['low'], yesterday_low, params.zone_tolerance):
                     if self._is_john_wick_up(candle):
-                        # Long entry
-                        stop = candle['low'] - (candle['range'] * 0.5)
+                        # Long entry — ATR-based stop for more room
+                        atr_val = candle.get('atr', candle['range'] * 2)
+                        if pd.isna(atr_val) or atr_val == 0:
+                            atr_val = candle['range'] * 2
+                        stop = candle['close'] - 1.5 * atr_val
                         target = yesterday_high
 
                         signals.append(Signal(
@@ -366,6 +404,41 @@ class MarketMemoryStrategy(BaseStrategy):
 
                         in_position = True
                         position_type = 'long'
+                        entry_price = candle['close']
+                        stop_loss = stop
+                        target_price = target
+                        breakeven_moved = False
+                        continue
+
+                # SHORT SETUP: Price near yesterday's high with John Wick down (rejection)
+                if self._is_near_level(candle['high'], yesterday_high, params.zone_tolerance):
+                    if self._is_john_wick_down(candle):
+                        # Short entry — ATR-based stop for more room
+                        atr_val = candle.get('atr', candle['range'] * 2)
+                        if pd.isna(atr_val) or atr_val == 0:
+                            atr_val = candle['range'] * 2
+                        stop = candle['close'] + 1.5 * atr_val
+                        target = yesterday_low
+
+                        signals.append(Signal(
+                            timestamp=timestamp,
+                            signal_type=SignalType.SHORT,
+                            price=candle['close'],
+                            symbol="",
+                            confidence=0.75,
+                            stop_loss=stop,
+                            take_profit=target,
+                            position_size=params.position_size,
+                            reason=f"John Wick down at yesterday's high ({yesterday_high:.2f})",
+                            metadata={
+                                'yesterday_high': yesterday_high,
+                                'yesterday_low': yesterday_low,
+                                'pattern': 'john_wick_down',
+                            }
+                        ))
+
+                        in_position = True
+                        position_type = 'short'
                         entry_price = candle['close']
                         stop_loss = stop
                         target_price = target
@@ -405,9 +478,10 @@ class MarketMemoryStrategy(BaseStrategy):
             # Close position at end of day if still open
             if in_position:
                 last_candle = today_data.iloc[-1]
+                exit_type = SignalType.EXIT_LONG if position_type == 'long' else SignalType.EXIT_SHORT
                 signals.append(Signal(
                     timestamp=today_data.index[-1],
-                    signal_type=SignalType.EXIT_LONG,
+                    signal_type=exit_type,
                     price=last_candle['close'],
                     symbol="",
                     confidence=0.5,

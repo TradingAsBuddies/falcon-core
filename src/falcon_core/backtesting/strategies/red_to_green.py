@@ -43,7 +43,7 @@ class RedToGreenParams(StrategyParams):
     recommended_interval: str = "1m"
 
     # Gap criteria
-    min_gap_pct: float = 0.03  # Minimum 3% gap down
+    min_gap_pct: float = 0.01  # Minimum 1% gap down
     max_gap_pct: float = 0.15  # Max 15% gap (avoid extreme moves)
 
     # Entry timing
@@ -118,25 +118,17 @@ class RedToGreenStrategy(BaseStrategy):
         if len(data) < 2:
             return signals
 
-        # Determine the previous close (first candle's open approximates it for intraday)
-        # In real usage, previous day's close would be passed in metadata
-        prev_close = data.iloc[0]['open']
-        open_price = data.iloc[0]['open']
-
-        # Check gap: open must be below prev close by min_gap_pct
-        gap_pct = (prev_close - open_price) / prev_close if prev_close > 0 else 0
-
-        if gap_pct < params.min_gap_pct or gap_pct > params.max_gap_pct:
+        # Detect day boundaries from the DatetimeIndex
+        if not isinstance(data.index, pd.DatetimeIndex):
             return signals
 
-        # Find first green candle
-        in_position = False
-        entry_price = None
-        stop_loss = None
-        take_profit = None
-        session_low = data.iloc[0]['low']
+        dates = data.index.date
+        unique_dates = sorted(set(dates))
 
-        # Determine bars for max entry window
+        if len(unique_dates) < 2:
+            return signals
+
+        # Determine bar interval for max entry window
         interval_minutes = 1
         if len(data) > 1:
             delta = (data.index[1] - data.index[0]).total_seconds() / 60
@@ -144,94 +136,125 @@ class RedToGreenStrategy(BaseStrategy):
                 interval_minutes = int(delta)
         max_bars = max(1, params.max_entry_minutes // interval_minutes)
 
-        for i in range(len(data)):
-            candle = data.iloc[i]
-            timestamp = data.index[i]
+        # Process each day independently (starting from day 2)
+        in_position = False
+        stop_loss = None
+        take_profit = None
 
-            # Track session low
-            session_low = min(session_low, candle['low'])
+        for day_idx in range(1, len(unique_dates)):
+            today = unique_dates[day_idx]
+            yesterday = unique_dates[day_idx - 1]
 
-            # Exit logic
-            if in_position:
-                if candle['low'] <= stop_loss:
-                    signals.append(Signal(
-                        timestamp=timestamp,
-                        signal_type=SignalType.EXIT_LONG,
-                        price=stop_loss,
-                        symbol="",
-                        confidence=1.0,
-                        reason="Stop loss triggered",
-                    ))
-                    in_position = False
+            yesterday_data = data[dates == yesterday]
+            today_data = data[dates == today]
+
+            if yesterday_data.empty or today_data.empty:
+                continue
+
+            # Use previous day's last close as prev_close
+            prev_close = yesterday_data.iloc[-1]['close']
+            open_price = today_data.iloc[0]['open']
+
+            # Check gap: open must be below prev close by min_gap_pct
+            gap_pct = (prev_close - open_price) / prev_close if prev_close > 0 else 0
+
+            if gap_pct < params.min_gap_pct or gap_pct > params.max_gap_pct:
+                continue
+
+            # Find first green candle in today's data
+            session_low = today_data.iloc[0]['low']
+            entry_found = False
+
+            for j in range(len(today_data)):
+                candle = today_data.iloc[j]
+                timestamp = today_data.index[j]
+
+                # Track session low
+                session_low = min(session_low, candle['low'])
+
+                # Exit logic
+                if in_position:
+                    if candle['low'] <= stop_loss:
+                        signals.append(Signal(
+                            timestamp=timestamp,
+                            signal_type=SignalType.EXIT_LONG,
+                            price=stop_loss,
+                            symbol="",
+                            confidence=1.0,
+                            reason="Stop loss triggered",
+                        ))
+                        in_position = False
+                        continue
+
+                    if candle['high'] >= take_profit:
+                        signals.append(Signal(
+                            timestamp=timestamp,
+                            signal_type=SignalType.EXIT_LONG,
+                            price=take_profit,
+                            symbol="",
+                            confidence=1.0,
+                            reason="Take profit (gap fill target)",
+                        ))
+                        in_position = False
                     continue
 
-                if candle['high'] >= take_profit:
-                    signals.append(Signal(
-                        timestamp=timestamp,
-                        signal_type=SignalType.EXIT_LONG,
-                        price=take_profit,
-                        symbol="",
-                        confidence=1.0,
-                        reason="Take profit (gap fill target)",
-                    ))
-                    in_position = False
-                continue
+                if entry_found:
+                    continue
 
-            # Only look for entries in the first N bars
-            if i >= max_bars:
-                continue
+                # Only look for entries in the first N bars of the day
+                if j >= max_bars:
+                    continue
 
-            # Look for first green candle
-            if not candle.get('is_green', False):
-                continue
+                # Look for first green candle
+                if not candle.get('is_green', False):
+                    continue
 
-            # Body must be meaningful
-            body_pct = candle.get('body_pct', 0)
-            if body_pct < params.min_green_body_pct:
-                continue
+                # Body must be meaningful
+                body_pct = candle.get('body_pct', 0)
+                if body_pct < params.min_green_body_pct:
+                    continue
 
-            # Volume confirmation
-            vol_ratio = candle.get('volume_ratio', 0)
-            if not pd.isna(vol_ratio) and vol_ratio < params.min_volume_ratio:
-                continue
+                # Volume confirmation
+                vol_ratio = candle.get('volume_ratio', 0)
+                if not pd.isna(vol_ratio) and vol_ratio < params.min_volume_ratio:
+                    continue
 
-            # Entry: first green candle
-            stop = session_low * (1 - 0.002)  # Just below session low
-            risk = candle['close'] - stop
+                # Entry: first green candle
+                stop = session_low * (1 - 0.002)  # Just below session low
+                risk = candle['close'] - stop
 
-            # Target is gap fill (previous close) or R/R based
-            gap_fill_target = prev_close
-            rr_target = candle['close'] + risk * params.risk_reward_ratio
-            target = min(gap_fill_target, rr_target)  # Closer target
+                # Target is gap fill (previous close) or R/R based
+                gap_fill_target = prev_close
+                rr_target = candle['close'] + risk * params.risk_reward_ratio
+                target = min(gap_fill_target, rr_target)  # Closer target
 
-            if risk <= 0:
-                continue
+                if risk <= 0:
+                    continue
 
-            confidence = min(1.0, 0.5 + gap_pct * 3 + min(body_pct * 50, 0.2))
+                confidence = min(1.0, 0.5 + gap_pct * 3 + min(body_pct * 50, 0.2))
 
-            signals.append(Signal(
-                timestamp=timestamp,
-                signal_type=SignalType.LONG,
-                price=candle['close'],
-                symbol="",
-                confidence=confidence,
-                stop_loss=stop,
-                take_profit=target,
-                position_size=params.position_size,
-                reason=f"Red-to-green: {gap_pct:.1%} gap down, first green candle",
-                metadata={
-                    'gap_pct': gap_pct,
-                    'prev_close': prev_close,
-                    'session_low': session_low,
-                    'candle_number': i,
-                    'body_pct': body_pct,
-                },
-            ))
+                signals.append(Signal(
+                    timestamp=timestamp,
+                    signal_type=SignalType.LONG,
+                    price=candle['close'],
+                    symbol="",
+                    confidence=confidence,
+                    stop_loss=stop,
+                    take_profit=target,
+                    position_size=params.position_size,
+                    reason=f"Red-to-green: {gap_pct:.1%} gap down, first green candle",
+                    metadata={
+                        'gap_pct': gap_pct,
+                        'prev_close': prev_close,
+                        'session_low': session_low,
+                        'candle_number': j,
+                        'body_pct': body_pct,
+                    },
+                ))
 
-            in_position = True
-            entry_price = candle['close']
-            stop_loss = stop
-            take_profit = target
-            break  # Only one entry per day for this strategy
+                in_position = True
+                entry_found = True
+                stop_loss = stop
+                take_profit = target
 
         return signals

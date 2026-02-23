@@ -6,6 +6,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /
 RUN pip install --upgrade pip
 
 COPY . .
-RUN pip install --no-cache-dir --timeout 120 ".[data-sync]"
-
-ENTRYPOINT ["falcon-data-sync"]
+RUN pip install --no-cache-dir --timeout 120 ".[full]"

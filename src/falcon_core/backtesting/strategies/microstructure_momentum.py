@@ -45,10 +45,10 @@ class MicrostructureMomentumParams(StrategyParams):
 
     # Delta calculation
     delta_lookback: int = 10  # Bars for cumulative delta window
-    acceleration_threshold: float = 0.002  # Min delta acceleration for signal
+    acceleration_threshold: float = 0.5  # Min delta acceleration for signal (normalized)
 
     # Volume surge
-    volume_surge_mult: float = 2.0  # Volume must be 2x average
+    volume_surge_mult: float = 2.5  # Volume must be 2.5x average
 
     # Price acceleration
     price_accel_lookback: int = 5  # Bars for price acceleration calc
@@ -64,7 +64,7 @@ class MicrostructureMomentumParams(StrategyParams):
     trade_end_time: str = "11:00"  # Only first 90 min (highest volume)
 
     # Cooldown
-    min_bars_between_trades: int = 5  # Avoid overtrading
+    min_bars_between_trades: int = 10  # Longer cooldown to avoid overtrading
 
     @classmethod
     def from_dict(cls, data: Dict) -> "MicrostructureMomentumParams":
@@ -107,9 +107,14 @@ class MicrostructureMomentumStrategy(BaseStrategy):
         indicators = super().calculate_indicators(data)
         params = self.params
 
-        # Classify volume as up or down based on candle direction
-        up_volume = data['volume'].where(data['close'] >= data['open'], 0)
-        down_volume = data['volume'].where(data['close'] < data['open'], 0)
+        # Proportional volume splitting based on candle position
+        # Instead of binary up/down, split proportionally by where close is in range
+        candle_range = data['high'] - data['low']
+        # Fraction of range that is "up" (close relative to low within the range)
+        up_pct = (data['close'] - data['low']) / candle_range.replace(0, np.nan)
+        up_pct = up_pct.fillna(0.5)  # Doji candles get 50/50 split
+        up_volume = data['volume'] * up_pct
+        down_volume = data['volume'] * (1 - up_pct)
 
         # Bar delta: up_volume - down_volume
         indicators['bar_delta'] = up_volume - down_volume
@@ -122,10 +127,8 @@ class MicrostructureMomentumStrategy(BaseStrategy):
         # Delta acceleration (rate of change of cumulative delta)
         cum_delta = indicators['cum_delta']
         avg_volume = data['volume'].rolling(20).mean()
-        # Normalize delta by average volume to get a comparable ratio
-        indicators['delta_accel'] = cum_delta.diff(params.price_accel_lookback) / (
-            avg_volume * params.delta_lookback
-        )
+        # Normalize delta by average volume only (not * delta_lookback)
+        indicators['delta_accel'] = cum_delta.diff(params.price_accel_lookback) / avg_volume
 
         # Volume ratio
         indicators['volume_ratio'] = data['volume'] / avg_volume
@@ -223,6 +226,10 @@ class MicrostructureMomentumStrategy(BaseStrategy):
             if abs(delta_accel) < params.acceleration_threshold:
                 continue
 
+            # Price-delta confirmation: price acceleration must agree with delta direction
+            if (delta_accel > 0 and price_accel < 0) or (delta_accel < 0 and price_accel > 0):
+                continue
+
             if delta_accel > 0:
                 # Bullish: aggressive buyers detected
                 stop = candle['close'] - params.atr_stop_mult * atr_val
@@ -231,7 +238,7 @@ class MicrostructureMomentumStrategy(BaseStrategy):
 
                 confidence = min(
                     1.0,
-                    0.5 + abs(delta_accel) * 50 + min(vol_ratio / 10, 0.2)
+                    0.5 + min(abs(delta_accel) / 2, 0.3) + min(vol_ratio / 10, 0.2)
                 )
 
                 signals.append(Signal(
@@ -266,7 +273,7 @@ class MicrostructureMomentumStrategy(BaseStrategy):
 
                 confidence = min(
                     1.0,
-                    0.5 + abs(delta_accel) * 50 + min(vol_ratio / 10, 0.2)
+                    0.5 + min(abs(delta_accel) / 2, 0.3) + min(vol_ratio / 10, 0.2)
                 )
 
                 signals.append(Signal(

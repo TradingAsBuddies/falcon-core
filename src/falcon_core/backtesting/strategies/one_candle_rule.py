@@ -48,17 +48,17 @@ class OneCandleRuleParams(StrategyParams):
     recommended_interval: str = "1m"
 
     # Support/Resistance detection
-    sr_lookback: int = 30  # 30 minutes of data for S/R detection
-    sr_tolerance: float = 0.001  # 0.1% tolerance (tighter for 1-min)
+    sr_lookback: int = 60  # 60 minutes of data for S/R detection
+    sr_tolerance: float = 0.003  # 0.3% tolerance for clustering
     min_level_touches: int = 2  # Minimum touches to confirm S/R level
 
     # Breakout detection
     breakout_threshold: float = 0.002  # 0.2% beyond level (tighter for intraday)
-    min_breakout_volume_mult: float = 1.5  # Volume must be 1.5x average
+    min_breakout_volume_mult: float = 1.2  # Volume must be 1.2x average
 
     # Retest detection
-    retest_tolerance: float = 0.003  # 0.3% tolerance for retest
-    max_retest_candles: int = 15  # Max 15 minutes to wait for retest
+    retest_tolerance: float = 0.005  # 0.5% tolerance for retest
+    max_retest_candles: int = 30  # Max 30 minutes to wait for retest
 
     # Confirmation candle
     min_wick_body_ratio: float = 1.5  # Lower wick must be 1.5x body for hammer

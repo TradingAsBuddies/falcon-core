@@ -219,21 +219,20 @@ class SimpleBacktestEngine(BacktestEngine):
 
         for signal in signals:
             if signal.signal_type == SignalType.LONG and position is None:
-                # Open position
-                entry_price = signal.price * (1 + self.slippage)
-                entry_price *= (1 + self.commission)
+                # Open long position (slippage multiplicative, commission additive)
+                entry_price = signal.price * (1 + self.slippage) + signal.price * self.commission
                 position = {
                     "entry_time": signal.timestamp,
                     "entry_price": entry_price,
                     "size": signal.position_size or self.initial_capital * 0.1,
                     "stop_loss": signal.stop_loss,
                     "take_profit": signal.take_profit,
+                    "direction": "long",
                 }
 
-            elif signal.signal_type == SignalType.EXIT_LONG and position is not None:
-                # Close position
-                exit_price = signal.price * (1 - self.slippage)
-                exit_price *= (1 - self.commission)
+            elif signal.signal_type == SignalType.EXIT_LONG and position is not None and position["direction"] == "long":
+                # Close long position (slippage multiplicative, commission additive)
+                exit_price = signal.price * (1 - self.slippage) - signal.price * self.commission
 
                 pnl = (exit_price - position["entry_price"]) / position["entry_price"]
                 pnl_dollar = position["size"] * pnl
@@ -246,6 +245,40 @@ class SimpleBacktestEngine(BacktestEngine):
                     "size": position["size"],
                     "pnl_pct": pnl,
                     "pnl_dollar": pnl_dollar,
+                    "direction": "long",
+                    "duration": (signal.timestamp - position["entry_time"]).days
+                    if hasattr(signal.timestamp, 'days') else 1,
+                })
+                position = None
+
+            elif signal.signal_type == SignalType.SHORT and position is None:
+                # Open short position (slippage works against us — price slips down, commission additive)
+                entry_price = signal.price * (1 - self.slippage) - signal.price * self.commission
+                position = {
+                    "entry_time": signal.timestamp,
+                    "entry_price": entry_price,
+                    "size": signal.position_size or self.initial_capital * 0.1,
+                    "stop_loss": signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                    "direction": "short",
+                }
+
+            elif signal.signal_type == SignalType.EXIT_SHORT and position is not None and position["direction"] == "short":
+                # Close short position (slippage multiplicative, commission additive)
+                exit_price = signal.price * (1 + self.slippage) + signal.price * self.commission
+
+                pnl = (position["entry_price"] - exit_price) / position["entry_price"]
+                pnl_dollar = position["size"] * pnl
+
+                trades_list.append({
+                    "entry_time": position["entry_time"],
+                    "exit_time": signal.timestamp,
+                    "entry_price": position["entry_price"],
+                    "exit_price": exit_price,
+                    "size": position["size"],
+                    "pnl_pct": pnl,
+                    "pnl_dollar": pnl_dollar,
+                    "direction": "short",
                     "duration": (signal.timestamp - position["entry_time"]).days
                     if hasattr(signal.timestamp, 'days') else 1,
                 })

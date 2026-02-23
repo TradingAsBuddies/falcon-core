@@ -42,11 +42,11 @@ class VWAPBounceParams(StrategyParams):
     recommended_interval: str = "5m"
 
     # VWAP proximity
-    vwap_tolerance: float = 0.002  # 0.2% band around VWAP
+    vwap_tolerance: float = 0.003  # 0.3% band around VWAP
     min_volume_ratio: float = 1.5  # Volume must be 1.5x average on touch
 
     # Rejection candle
-    rejection_wick_pct: float = 0.6  # Wick must be 60%+ of candle range
+    rejection_wick_pct: float = 0.5  # Wick must be 50%+ of candle range
 
     # Risk management
     risk_reward_ratio: float = 2.0
@@ -102,9 +102,18 @@ class VWAPBounceStrategy(BaseStrategy):
         indicators = super().calculate_indicators(data)
 
         # VWAP: cumulative (typical_price * volume) / cumulative volume
+        # Reset daily so VWAP doesn't become stale across multi-day data
         typical_price = (data['high'] + data['low'] + data['close']) / 3
-        cum_vol = data['volume'].cumsum()
-        cum_tp_vol = (typical_price * data['volume']).cumsum()
+        tp_vol = typical_price * data['volume']
+
+        if isinstance(data.index, pd.DatetimeIndex):
+            dates = data.index.date
+            cum_vol = data.groupby(dates)['volume'].cumsum()
+            cum_tp_vol = tp_vol.groupby(dates).cumsum()
+        else:
+            cum_vol = data['volume'].cumsum()
+            cum_tp_vol = tp_vol.cumsum()
+
         indicators['vwap'] = cum_tp_vol / cum_vol
 
         # Volume ratio
@@ -132,9 +141,30 @@ class VWAPBounceStrategy(BaseStrategy):
         stop_loss = None
         take_profit = None
 
-        for i in range(max(params.trend_sma_period, 20), len(data)):
+        # Day boundary tracking
+        start_idx = max(params.trend_sma_period, 20)
+        has_dates = isinstance(data.index, pd.DatetimeIndex)
+        prev_date = data.index[start_idx].date() if has_dates and start_idx < len(data) else None
+
+        for i in range(start_idx, len(data)):
             candle = data.iloc[i]
             timestamp = data.index[i]
+            current_date = timestamp.date() if has_dates else None
+
+            # Day boundary — force close and reset state
+            if has_dates and current_date != prev_date:
+                if in_position:
+                    prev_day_last = data.iloc[i - 1]
+                    signals.append(Signal(
+                        timestamp=data.index[i - 1],
+                        signal_type=SignalType.EXIT_LONG,
+                        price=prev_day_last['close'],
+                        symbol="",
+                        confidence=0.5,
+                        reason="End of day — closing VWAP bounce position",
+                    ))
+                    in_position = False
+                prev_date = current_date
 
             # Exit logic
             if in_position:

@@ -49,14 +49,20 @@ class VolatilitySqueezeParams(StrategyParams):
 
     # Keltner Channels
     kc_period: int = 20
-    kc_atr_mult: float = 1.5
+    kc_atr_mult: float = 1.0  # Narrower KC = squeeze is rarer and more meaningful
 
     # Momentum
     momentum_period: int = 12  # Rate of change lookback
-    min_momentum: float = 0.001  # Minimum momentum to confirm direction
+    min_momentum: float = 0.003  # Stronger directional conviction required
 
     # Squeeze detection
-    min_squeeze_bars: int = 3  # Minimum bars in squeeze before firing
+    min_squeeze_bars: int = 6  # Longer compression = bigger expected move
+
+    # Volume confirmation on squeeze fire
+    min_fire_volume_ratio: float = 1.3  # Volume must be 1.3x avg when squeeze fires
+
+    # Cooldown
+    min_bars_between_trades: int = 6  # Avoid re-entry chop
 
     # Risk management
     atr_stop_mult: float = 1.5  # Stop loss = 1.5 ATR
@@ -136,6 +142,9 @@ class VolatilitySqueezeStrategy(BaseStrategy):
         # Momentum: rate of change
         indicators['momentum'] = close.pct_change(params.momentum_period)
 
+        # Volume ratio for fire bar confirmation
+        indicators['volume_ratio'] = data['volume'] / data['volume'].rolling(20).mean()
+
         # Count consecutive squeeze bars
         squeeze = indicators['squeeze_on'].astype(int)
         # Reset counter on squeeze_off
@@ -159,11 +168,36 @@ class VolatilitySqueezeStrategy(BaseStrategy):
         position_direction = None
         stop_loss = None
         take_profit = None
+        last_trade_bar = -params.min_bars_between_trades
+
+        # Day boundary tracking
+        has_dates = isinstance(data.index, pd.DatetimeIndex)
+        prev_date = data.index[warmup].date() if has_dates and warmup < len(data) else None
 
         for i in range(warmup, len(data)):
             candle = data.iloc[i]
             prev = data.iloc[i - 1]
             timestamp = data.index[i]
+            current_date = timestamp.date() if has_dates else None
+
+            # Day boundary — force close positions and reset state
+            if has_dates and current_date != prev_date:
+                if in_position:
+                    prev_day_last = data.iloc[i - 1]
+                    exit_type = SignalType.EXIT_LONG if position_direction == 'long' else SignalType.EXIT_SHORT
+                    signals.append(Signal(
+                        timestamp=data.index[i - 1],
+                        signal_type=exit_type,
+                        price=prev_day_last['close'],
+                        symbol="",
+                        confidence=0.5,
+                        reason="End of day — closing squeeze position",
+                    ))
+                    in_position = False
+                    position_direction = None
+                # Reset cooldown and squeeze tracking at day boundary
+                last_trade_bar = -params.min_bars_between_trades
+                prev_date = current_date
 
             # Exit logic
             if in_position:
@@ -215,6 +249,10 @@ class VolatilitySqueezeStrategy(BaseStrategy):
                         continue
                 continue
 
+            # Cooldown check
+            if i - last_trade_bar < params.min_bars_between_trades:
+                continue
+
             # Squeeze fire detection: was in squeeze, now out
             prev_squeeze = prev.get('squeeze_on', False)
             curr_squeeze = candle.get('squeeze_on', False)
@@ -225,6 +263,11 @@ class VolatilitySqueezeStrategy(BaseStrategy):
 
             # Must have been in squeeze for minimum bars
             if squeeze_count < params.min_squeeze_bars:
+                continue
+
+            # Volume confirmation on fire bar
+            vol_ratio = candle.get('volume_ratio', 0)
+            if pd.isna(vol_ratio) or vol_ratio < params.min_fire_volume_ratio:
                 continue
 
             # Momentum direction
@@ -268,6 +311,7 @@ class VolatilitySqueezeStrategy(BaseStrategy):
                 position_direction = 'long'
                 stop_loss = stop
                 take_profit = target
+                last_trade_bar = i
 
             else:
                 # Short entry
@@ -298,5 +342,6 @@ class VolatilitySqueezeStrategy(BaseStrategy):
                 position_direction = 'short'
                 stop_loss = stop
                 take_profit = target
+                last_trade_bar = i
 
         return signals
