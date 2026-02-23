@@ -136,6 +136,10 @@ class FalconConfig:
             'max_positions': 10,
             'max_position_size': 0.1,  # 10% of portfolio
 
+            # Strategy plugins
+            'strategy_dir': str(base_dir / 'strategies'),
+            'advisor_model': 'claude-haiku-4-5-20251001',
+
             # Screener
             'finviz_screener_url': '',
 
@@ -259,6 +263,8 @@ class FalconConfig:
             'FLASK_HOST': 'flask_host',
             'FLASK_PORT': 'flask_port',
             'FLASK_DEBUG': 'flask_debug',
+            'FALCON_STRATEGY_DIR': 'strategy_dir',
+            'FALCON_ADVISOR_MODEL': 'advisor_model',
         }
 
         # DATABASE_URL takes precedence over individual DB_* vars
@@ -294,6 +300,8 @@ class FalconConfig:
             'INITIAL_BALANCE': 'initial_balance',
             'FALCON_DATA_DIR': 'base_dir',
             'FALCON_CONFIG_PATH': 'config_path',
+            'FALCON_STRATEGY_DIR': 'strategy_dir',
+            'FALCON_ADVISOR_MODEL': 'advisor_model',
         }
 
         return mappings.get(env_key, env_key.lower())

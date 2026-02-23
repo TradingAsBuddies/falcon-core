@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="falcon-core",
-    version="0.2.0",
+    version="0.3.0",
     description="Falcon Trading Platform - Core Libraries",
     author="TradingAsBuddies",
     url="https://github.com/TradingAsBuddies/falcon-core",
@@ -30,6 +30,9 @@ setup(
             "boto3>=1.34.0",
             "pyarrow>=14.0.0",
         ],
+        "advisor": [
+            "anthropic>=0.39.0",
+        ],
         "full": [
             "psycopg2-binary>=2.9.9",
             "bt>=0.2.9",
@@ -37,6 +40,7 @@ setup(
             "yfinance>=0.2.28",
             "boto3>=1.34.0",
             "pyarrow>=14.0.0",
+            "anthropic>=0.39.0",
         ],
     },
     entry_points={
@@ -44,6 +48,8 @@ setup(
             "falcon-backtest=falcon_core.backtesting.cli:main",
             "falcon-data-sync=falcon_core.data_sync_cli:main",
             "falcon-strategy-seed=falcon_core.strategy_seeder:main",
+            "falcon-migrate-strategies=falcon_core.migrate_strategies:main",
+            "falcon-advisor=falcon_core.advisor_cli:main",
         ],
     },
     classifiers=[

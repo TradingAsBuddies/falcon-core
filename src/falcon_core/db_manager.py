@@ -187,6 +187,8 @@ class DatabaseManager:
         self._create_screener_tables()
         self._create_market_data_tables()
         self._create_strategy_rotation_tables()
+        self._migrate_strategy_roster_v2()
+        self._create_advisor_tables()
         logger.info("Database schema initialized successfully")
 
     def _create_trading_tables(self):
@@ -715,6 +717,187 @@ class DatabaseManager:
         self.execute(rotation_log_index_sql)
 
         logger.info("Strategy rotation tables created")
+
+    def _migrate_strategy_roster_v2(self):
+        """Add strategy_code and strategy_source columns to strategy_roster if missing."""
+        try:
+            if self.db_type == 'sqlite':
+                # Check columns via PRAGMA
+                cols = self.execute(
+                    "PRAGMA table_info(strategy_roster)", fetch='all'
+                )
+                if cols is None:
+                    return
+                col_names = {
+                    (c['name'] if isinstance(c, dict) else c[1]) for c in cols
+                }
+                if 'strategy_code' not in col_names:
+                    self.execute(
+                        'ALTER TABLE strategy_roster ADD COLUMN strategy_code TEXT'
+                    )
+                    logger.info("Added strategy_code column to strategy_roster")
+                if 'strategy_source' not in col_names:
+                    self.execute(
+                        "ALTER TABLE strategy_roster ADD COLUMN "
+                        "strategy_source TEXT DEFAULT 'manual'"
+                    )
+                    logger.info("Added strategy_source column to strategy_roster")
+            else:  # postgresql
+                # Check via information_schema
+                row = self.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'strategy_roster' "
+                    "AND column_name = 'strategy_code'",
+                    fetch='one'
+                )
+                if not row:
+                    self.execute(
+                        'ALTER TABLE strategy_roster ADD COLUMN strategy_code TEXT'
+                    )
+                    logger.info("Added strategy_code column to strategy_roster")
+                row = self.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'strategy_roster' "
+                    "AND column_name = 'strategy_source'",
+                    fetch='one'
+                )
+                if not row:
+                    self.execute(
+                        "ALTER TABLE strategy_roster ADD COLUMN "
+                        "strategy_source VARCHAR(20) DEFAULT 'manual'"
+                    )
+                    logger.info("Added strategy_source column to strategy_roster")
+        except Exception as e:
+            logger.debug(f"strategy_roster migration check: {e}")
+
+    def _create_advisor_tables(self):
+        """Create AI advisor and cost tracking tables."""
+
+        if self.db_type == 'sqlite':
+            api_usage_sql = '''
+                CREATE TABLE IF NOT EXISTS api_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service TEXT NOT NULL,
+                    model TEXT,
+                    strategy_name TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cost_usd REAL,
+                    request_type TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            '''
+            budget_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_advisor_budget (
+                    strategy_name TEXT PRIMARY KEY,
+                    monthly_budget_usd REAL DEFAULT 1.00,
+                    total_spent_usd REAL DEFAULT 0,
+                    current_month_spent_usd REAL DEFAULT 0,
+                    months_active INTEGER DEFAULT 0,
+                    max_months INTEGER DEFAULT 4,
+                    consecutive_no_improvement INTEGER DEFAULT 0,
+                    last_improvement_at TEXT,
+                    status TEXT DEFAULT 'active',
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+            '''
+            proposals_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name TEXT NOT NULL,
+                    proposal_type TEXT,
+                    current_code TEXT,
+                    proposed_code TEXT,
+                    analysis_summary TEXT,
+                    change_description TEXT,
+                    expected_improvement TEXT,
+                    current_sharpe REAL,
+                    proposed_sharpe REAL,
+                    current_win_rate REAL,
+                    proposed_win_rate REAL,
+                    current_total_return REAL,
+                    proposed_total_return REAL,
+                    status TEXT DEFAULT 'pending',
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    review_notes TEXT,
+                    api_cost_usd REAL,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    applied_at TEXT
+                )
+            '''
+        else:  # postgresql
+            api_usage_sql = '''
+                CREATE TABLE IF NOT EXISTS api_usage (
+                    id SERIAL PRIMARY KEY,
+                    service VARCHAR(50) NOT NULL,
+                    model VARCHAR(50),
+                    strategy_name VARCHAR(50),
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cost_usd DECIMAL(10,6),
+                    request_type VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            '''
+            budget_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_advisor_budget (
+                    strategy_name VARCHAR(50) PRIMARY KEY,
+                    monthly_budget_usd DECIMAL(6,2) DEFAULT 1.00,
+                    total_spent_usd DECIMAL(10,4) DEFAULT 0,
+                    current_month_spent_usd DECIMAL(10,4) DEFAULT 0,
+                    months_active INTEGER DEFAULT 0,
+                    max_months INTEGER DEFAULT 4,
+                    consecutive_no_improvement INTEGER DEFAULT 0,
+                    last_improvement_at TIMESTAMP,
+                    status VARCHAR(20) DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            '''
+            proposals_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_proposals (
+                    id SERIAL PRIMARY KEY,
+                    strategy_name VARCHAR(50) NOT NULL,
+                    proposal_type VARCHAR(20),
+                    current_code TEXT,
+                    proposed_code TEXT,
+                    analysis_summary TEXT,
+                    change_description TEXT,
+                    expected_improvement TEXT,
+                    current_sharpe DECIMAL(10,4),
+                    proposed_sharpe DECIMAL(10,4),
+                    current_win_rate DECIMAL(5,4),
+                    proposed_win_rate DECIMAL(5,4),
+                    current_total_return DECIMAL(10,4),
+                    proposed_total_return DECIMAL(10,4),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    reviewed_by VARCHAR(100),
+                    reviewed_at TIMESTAMP,
+                    review_notes TEXT,
+                    api_cost_usd DECIMAL(10,6),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    applied_at TIMESTAMP
+                )
+            '''
+
+        usage_index_sql = '''
+            CREATE INDEX IF NOT EXISTS idx_api_usage_service
+            ON api_usage(service)
+        '''
+        proposals_index_sql = '''
+            CREATE INDEX IF NOT EXISTS idx_strategy_proposals_status
+            ON strategy_proposals(status)
+        '''
+
+        self.execute(api_usage_sql)
+        self.execute(budget_sql)
+        self.execute(proposals_sql)
+        self.execute(usage_index_sql)
+        self.execute(proposals_index_sql)
+
+        logger.info("Advisor tables created")
 
     def init_account(self, initial_balance: float = 10000.0):
         """Initialize account with starting balance"""

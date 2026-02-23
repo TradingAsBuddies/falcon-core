@@ -25,10 +25,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _get_db():
+    """Get database manager for strategy loading."""
+    try:
+        from falcon_core.db_manager import get_db_manager
+        db = get_db_manager()
+        db.init_schema()
+        return db
+    except Exception:
+        return None
+
+
 def get_strategy_class(name: str):
     """Get strategy class by name"""
     from falcon_core.backtesting.strategies import get_available_strategies
-    strategies = get_available_strategies()
+    strategies = get_available_strategies(db=_get_db())
 
     if name not in strategies:
         available = ', '.join(strategies.keys())
@@ -41,7 +52,7 @@ def cmd_list_strategies(args):
     """List available strategies"""
     from falcon_core.backtesting.strategies import get_available_strategies
 
-    strategies = get_available_strategies()
+    strategies = get_available_strategies(db=_get_db())
 
     print("\nAvailable Strategies:")
     print("=" * 60)

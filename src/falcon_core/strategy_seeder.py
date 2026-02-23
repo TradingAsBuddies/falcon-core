@@ -78,7 +78,7 @@ def seed_strategies(db) -> List[str]:
     """
     from falcon_core.backtesting.strategies import get_available_strategies
 
-    strategies = get_available_strategies()
+    strategies = get_available_strategies(db=db)
     seeded = []
 
     for name, cls in strategies.items():
@@ -147,7 +147,6 @@ def run_backtests(db) -> Dict[str, Any]:
     Returns dict of strategy_name -> metrics.
     """
     from falcon_core.backtesting.strategies import get_available_strategies
-
     from datetime import timedelta, date as date_type
 
     try:
@@ -158,7 +157,7 @@ def run_backtests(db) -> Dict[str, Any]:
         logger.error("Install with: pip install falcon-core[backtesting]")
         return {}
 
-    strategies = get_available_strategies()
+    strategies = get_available_strategies(db=db)
     feed = DataFeed(db_manager=db)
     results = {}
 
