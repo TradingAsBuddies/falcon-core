@@ -344,6 +344,10 @@ class DataFeed:
 
             # Convert to DataFrame
             data = pd.DataFrame(result)
+            # Cast Decimal columns from PostgreSQL to float64
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col in data.columns:
+                    data[col] = pd.to_numeric(data[col], errors='coerce')
             data['timestamp'] = pd.to_datetime(data['timestamp'])
             data = data.set_index('timestamp')
 
