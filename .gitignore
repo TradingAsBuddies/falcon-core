@@ -21,3 +21,7 @@ build/
 
 # OS
 .DS_Store
+
+# Strategy plugins are data, not code — loaded from DB or /var/lib/falcon/strategies/
+src/falcon_core/backtesting/strategies/[a-z]*.py
+!src/falcon_core/backtesting/strategies/base.py
