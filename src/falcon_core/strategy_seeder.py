@@ -152,6 +152,7 @@ def run_backtests(db) -> Dict[str, Any]:
     try:
         from falcon_core.backtesting.data_feed import DataFeed
         from falcon_core.backtesting.engine import SimpleBacktestEngine
+        from falcon_core.backtesting.results_api import BacktestResultsStore, BacktestRunRecord
     except ImportError as e:
         logger.error(f"Backtesting dependencies not available: {e}")
         logger.error("Install with: pip install falcon-core[backtesting]")
@@ -159,6 +160,7 @@ def run_backtests(db) -> Dict[str, Any]:
 
     strategies = get_available_strategies(db=db)
     feed = DataFeed(db_manager=db)
+    results_store = BacktestResultsStore(db_manager=db)
     results = {}
 
     # Default date range: last 30 trading days (~6 weeks calendar)
@@ -226,6 +228,25 @@ def run_backtests(db) -> Dict[str, Any]:
                     f"    {symbol}: {result.total_return:.2%} return, "
                     f"{result.total_trades} trades, {result.win_rate:.1%} win rate"
                 )
+
+                # Store per-symbol result in backtest_runs table
+                try:
+                    record = BacktestRunRecord(
+                        strategy_name=name,
+                        symbol=symbol,
+                        trading_date=end_date,
+                        interval=interval,
+                        total_return=result.total_return,
+                        max_drawdown=getattr(result, 'max_drawdown', 0.0) or 0.0,
+                        sharpe_ratio=getattr(result, 'sharpe_ratio', 0.0) or 0.0,
+                        win_rate=result.win_rate,
+                        total_trades=result.total_trades,
+                        signals_count=getattr(result, 'signals_count', 0) or 0,
+                        parameters=strategy.params.to_dict() if hasattr(strategy.params, 'to_dict') else None,
+                    )
+                    results_store.store_backtest_run(record)
+                except Exception as store_err:
+                    logger.warning(f"    {symbol}: failed to store backtest result: {store_err}")
 
             except Exception as e:
                 logger.error(f"    {symbol}: backtest failed: {e}")
