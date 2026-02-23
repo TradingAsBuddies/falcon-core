@@ -189,6 +189,7 @@ class DatabaseManager:
         self._create_strategy_rotation_tables()
         self._migrate_strategy_roster_v2()
         self._create_advisor_tables()
+        self._create_backtest_results_tables()
         logger.info("Database schema initialized successfully")
 
     def _create_trading_tables(self):
@@ -898,6 +899,112 @@ class DatabaseManager:
         self.execute(proposals_index_sql)
 
         logger.info("Advisor tables created")
+
+    def _create_backtest_results_tables(self):
+        """Create tables for storing backtest results (replaces separate SQLite DB)."""
+
+        if self.db_type == 'sqlite':
+            backtest_runs_sql = '''
+                CREATE TABLE IF NOT EXISTS backtest_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name VARCHAR(100) NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    trading_date DATE NOT NULL,
+                    interval VARCHAR(10) DEFAULT '5m',
+                    total_return REAL DEFAULT 0,
+                    max_drawdown REAL DEFAULT 0,
+                    sharpe_ratio REAL DEFAULT 0,
+                    win_rate REAL DEFAULT 0,
+                    total_trades INTEGER DEFAULT 0,
+                    signals_count INTEGER DEFAULT 0,
+                    parameters TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            '''
+            feedback_results_sql = '''
+                CREATE TABLE IF NOT EXISTS feedback_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_date DATE NOT NULL,
+                    strategy_name VARCHAR(100) NOT NULL,
+                    symbols_tested INTEGER DEFAULT 0,
+                    total_trades INTEGER DEFAULT 0,
+                    avg_return REAL DEFAULT 0,
+                    avg_win_rate REAL DEFAULT 0,
+                    avg_sharpe REAL DEFAULT 0,
+                    adjustments_recommended BOOLEAN DEFAULT FALSE,
+                    adjustments_applied BOOLEAN DEFAULT FALSE,
+                    adjustment_details TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            '''
+            parameter_history_sql = '''
+                CREATE TABLE IF NOT EXISTS parameter_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name VARCHAR(100) NOT NULL,
+                    parameter_name VARCHAR(100) NOT NULL,
+                    old_value REAL,
+                    new_value REAL,
+                    reason TEXT,
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            '''
+        else:
+            backtest_runs_sql = '''
+                CREATE TABLE IF NOT EXISTS backtest_runs (
+                    id SERIAL PRIMARY KEY,
+                    strategy_name VARCHAR(100) NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    trading_date DATE NOT NULL,
+                    interval VARCHAR(10) DEFAULT '5m',
+                    total_return DECIMAL(10,6) DEFAULT 0,
+                    max_drawdown DECIMAL(10,6) DEFAULT 0,
+                    sharpe_ratio DECIMAL(10,4) DEFAULT 0,
+                    win_rate DECIMAL(10,6) DEFAULT 0,
+                    total_trades INTEGER DEFAULT 0,
+                    signals_count INTEGER DEFAULT 0,
+                    parameters TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            '''
+            feedback_results_sql = '''
+                CREATE TABLE IF NOT EXISTS feedback_results (
+                    id SERIAL PRIMARY KEY,
+                    run_date DATE NOT NULL,
+                    strategy_name VARCHAR(100) NOT NULL,
+                    symbols_tested INTEGER DEFAULT 0,
+                    total_trades INTEGER DEFAULT 0,
+                    avg_return DECIMAL(10,6) DEFAULT 0,
+                    avg_win_rate DECIMAL(10,6) DEFAULT 0,
+                    avg_sharpe DECIMAL(10,4) DEFAULT 0,
+                    adjustments_recommended BOOLEAN DEFAULT FALSE,
+                    adjustments_applied BOOLEAN DEFAULT FALSE,
+                    adjustment_details TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            '''
+            parameter_history_sql = '''
+                CREATE TABLE IF NOT EXISTS parameter_history (
+                    id SERIAL PRIMARY KEY,
+                    strategy_name VARCHAR(100) NOT NULL,
+                    parameter_name VARCHAR(100) NOT NULL,
+                    old_value DECIMAL(10,6),
+                    new_value DECIMAL(10,6),
+                    reason TEXT,
+                    applied_at TIMESTAMP DEFAULT NOW()
+                )
+            '''
+
+        self.execute(backtest_runs_sql)
+        self.execute(feedback_results_sql)
+        self.execute(parameter_history_sql)
+
+        # Indexes
+        self.execute('CREATE INDEX IF NOT EXISTS idx_backtest_runs_date ON backtest_runs(trading_date)')
+        self.execute('CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy ON backtest_runs(strategy_name)')
+        self.execute('CREATE INDEX IF NOT EXISTS idx_feedback_results_date ON feedback_results(run_date)')
+        self.execute('CREATE INDEX IF NOT EXISTS idx_parameter_history_strategy ON parameter_history(strategy_name)')
+
+        logger.info("Backtest results tables created")
 
     def init_account(self, initial_balance: float = 10000.0):
         """Initialize account with starting balance"""
