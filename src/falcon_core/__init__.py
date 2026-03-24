@@ -38,6 +38,11 @@ def get_data_sync_pipeline(*args, **kwargs):
     from falcon_core.data_sync import DataSyncPipeline
     return DataSyncPipeline(*args, **kwargs)
 
+def get_sentinel_runner(*args, **kwargs):
+    """Factory function for sentinel health check runner"""
+    from falcon_core.sentinel import SentinelRunner
+    return SentinelRunner(*args, **kwargs)
+
 __version__ = "0.2.0"
 __all__ = [
     # Database
@@ -57,4 +62,6 @@ __all__ = [
     "get_data_feed",
     # Data Sync
     "get_data_sync_pipeline",
+    # Sentinel
+    "get_sentinel_runner",
 ]
