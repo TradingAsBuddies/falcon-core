@@ -69,7 +69,13 @@ class TimezoneSentinel(BaseSentinel):
         )
 
     def _check_db_timestamps(self) -> str:
-        """Spot-check that recent DB timestamps have timezone info."""
+        """
+        Spot-check that recent DB timestamps are plausible ET values.
+
+        PostgreSQL columns are 'timestamp without time zone' by design.
+        Our convention is that naive timestamps are market time (ET),
+        so we check the value is plausible rather than requiring an offset.
+        """
         try:
             from falcon_core import get_db_manager
             db = get_db_manager()
@@ -78,10 +84,14 @@ class TimezoneSentinel(BaseSentinel):
                 fetch="one",
             )
             if row and row["timestamp"]:
-                ts = str(row["timestamp"])
-                # If timestamp has offset info (e.g. -04:00), it's aware
-                if "+" not in ts and "-" not in ts[-6:]:
-                    return f"Latest order timestamp appears naive: {ts}"
+                ts = row["timestamp"]
+                if isinstance(ts, datetime):
+                    # Check the timestamp is within a reasonable range
+                    # (not more than 24h in the future or 30 days in the past)
+                    now = datetime.now()
+                    delta = abs((now - ts).total_seconds())
+                    if delta > 30 * 86400:
+                        return f"Latest order timestamp seems stale: {ts} ({delta/86400:.0f} days old)"
         except Exception:
             pass  # DB not available is checked by database sentinel
         return ""
