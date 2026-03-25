@@ -103,6 +103,8 @@ class SentinelRunner:
         sentinel_factories = [
             ("falcon_core.sentinel.check_database", "DatabaseSentinel"),
             ("falcon_core.sentinel.check_data_feed", "DataFeedSentinel"),
+            ("falcon_core.sentinel.check_data_feed", "DataFeedMinuteSentinel"),
+            ("falcon_core.sentinel.check_data_feed", "PolygonMinuteSentinel"),
             ("falcon_core.sentinel.check_strategy_roster", "StrategyRosterSentinel"),
             ("falcon_core.sentinel.check_backtest_engine", "BacktestEngineSentinel"),
             ("falcon_core.sentinel.check_timezone", "TimezoneSentinel"),
