@@ -108,6 +108,7 @@ class SentinelRunner:
             ("falcon_core.sentinel.check_strategy_roster", "StrategyRosterSentinel"),
             ("falcon_core.sentinel.check_backtest_engine", "BacktestEngineSentinel"),
             ("falcon_core.sentinel.check_timezone", "TimezoneSentinel"),
+            ("falcon_core.sentinel.check_market_page", "MarketPageSentinel"),
         ]
 
         for module_path, class_name in sentinel_factories:
