@@ -43,6 +43,8 @@ def get_sentinel_runner(*args, **kwargs):
     from falcon_core.sentinel import SentinelRunner
     return SentinelRunner(*args, **kwargs)
 
+from falcon_core.http import http_get, http_post, RetryExhausted
+
 __version__ = "0.2.0"
 __all__ = [
     # Database
@@ -64,4 +66,8 @@ __all__ = [
     "get_data_sync_pipeline",
     # Sentinel
     "get_sentinel_runner",
+    # HTTP
+    "http_get",
+    "http_post",
+    "RetryExhausted",
 ]
