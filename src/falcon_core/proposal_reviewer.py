@@ -234,7 +234,13 @@ class ProposalReviewer:
             improvement=improvement,
         )
 
-        # Update proposal in DB
+        # Update proposal in DB (cast numpy types to native Python for PostgreSQL)
+        def _f(v):
+            """Ensure value is a native Python float for PostgreSQL."""
+            if v is None:
+                return 0.0
+            return float(v)
+
         now = datetime.now().isoformat()
         self.db.execute(
             """UPDATE strategy_proposals SET
@@ -251,12 +257,12 @@ class ProposalReviewer:
                WHERE id = %s""",
             (
                 decision, 'proposal-reviewer', now, reason,
-                current_metrics.get('sharpe', 0),
-                proposed_metrics.get('sharpe', 0),
-                current_metrics.get('win_rate', 0),
-                proposed_metrics.get('win_rate', 0),
-                current_metrics.get('total_return', 0),
-                proposed_metrics.get('total_return', 0),
+                _f(current_metrics.get('sharpe', 0)),
+                _f(proposed_metrics.get('sharpe', 0)),
+                _f(current_metrics.get('win_rate', 0)),
+                _f(proposed_metrics.get('win_rate', 0)),
+                _f(current_metrics.get('total_return', 0)),
+                _f(proposed_metrics.get('total_return', 0)),
                 proposal_id,
             ),
         )
@@ -406,9 +412,9 @@ class ProposalReviewer:
                    WHERE strategy_name = %s""",
                 (
                     proposed_code,
-                    metrics.get('sharpe', 0),
-                    metrics.get('win_rate', 0),
-                    metrics.get('total_return', 0),
+                    float(metrics.get('sharpe', 0) or 0),
+                    float(metrics.get('win_rate', 0) or 0),
+                    float(metrics.get('total_return', 0) or 0),
                     now, now, strategy_name,
                 ),
             )
