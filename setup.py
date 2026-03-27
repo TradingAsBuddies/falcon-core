@@ -51,6 +51,7 @@ setup(
             "falcon-migrate-strategies=falcon_core.migrate_strategies:main",
             "falcon-advisor=falcon_core.advisor_cli:main",
             "falcon-sentinel=falcon_core.sentinel.cli:main",
+            "falcon-proposal-review=falcon_core.proposal_review_cli:main",
         ],
     },
     classifiers=[
