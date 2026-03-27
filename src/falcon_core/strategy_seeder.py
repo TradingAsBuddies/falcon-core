@@ -718,9 +718,23 @@ Examples:
                 results = run_backtests(db)
                 if results:
                     print(f"\nBacktest complete for {len(results)} strategies.")
-                    show_status(db)
                 else:
                     print("\nNo backtests completed (check data availability).")
+
+                # Auto-rotate after backtests
+                print("\nApplying rotation gates...")
+                actions = auto_rotate(db)
+                promoted = actions.get('promoted', [])
+                retired = actions.get('retired', [])
+                if promoted or retired:
+                    for a in promoted:
+                        print(f"  [+] {a['name']}: {a['reason']}")
+                    for a in retired:
+                        print(f"  [x] {a['name']}: {a['reason']}")
+                else:
+                    print("  No rotations needed.")
+
+                show_status(db)
 
             # Always show status at end
             if not args.backtest:
