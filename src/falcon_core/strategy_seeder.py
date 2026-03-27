@@ -409,6 +409,237 @@ def demote_strategy(db, strategy_name: str, reason: str = ""):
     print(f"Demoted '{strategy_name}': {current_status} -> review (reason: {reason or 'N/A'})")
 
 
+# ── Promotion / Demotion Gates ──────────────────────────────────────
+#
+# Lifecycle:  backtest → paper_trading → live → (demote) → review → backtest
+#
+# Promotion thresholds are intentionally conservative — false promotions
+# cost real money, false demotions just delay by one cycle.
+
+PROMOTION_GATES = {
+    # backtest → paper_trading
+    'to_paper': {
+        'min_sharpe': 0.0,           # Must be non-negative
+        'min_win_rate': 0.20,        # At least 20% win rate
+        'min_trades': 5,             # At least 5 trades in backtest
+        'max_days_since_backtest': 7,  # Backtested in last 7 days
+    },
+    # paper_trading → live  (future — requires paper trading metrics)
+    'to_live': {
+        'min_paper_sharpe': 0.5,
+        'min_paper_win_rate': 0.30,
+        'min_paper_trades': 10,
+    },
+}
+
+DEMOTION_RULES = {
+    'zero_trade_cycles': 3,          # Retire after N backtest cycles with 0 trades
+    'negative_sharpe_cycles': 5,     # Demote after N cycles with negative Sharpe
+    'max_review_days': 30,           # Retire if stuck in review for this long
+}
+
+
+def auto_rotate(db, dry_run: bool = False) -> Dict[str, Any]:
+    """
+    Apply automated promotion and demotion gates to all strategies.
+
+    Returns dict with rotation actions taken.
+    """
+    from datetime import timedelta
+
+    now = datetime.now()
+    now_str = now.isoformat()
+    actions = {'promoted': [], 'demoted': [], 'retired': [], 'unchanged': []}
+
+    rows = db.execute(
+        '''SELECT strategy_name, status, backtest_sharpe, backtest_win_rate,
+                  backtest_total_return, backtest_profit_factor,
+                  paper_sharpe, paper_win_rate, paper_profit_factor,
+                  last_backtest_at, promoted_at, demoted_at
+           FROM strategy_roster ORDER BY strategy_name''',
+        fetch='all',
+    )
+
+    if not rows:
+        return actions
+
+    # Count consecutive zero-trade cycles per strategy from backtest_runs
+    zero_trade_counts = {}
+    cycle_rows = db.execute(
+        '''SELECT strategy_name,
+                  count(*) FILTER (WHERE total_trades = 0) as zero_cycles,
+                  count(*) as total_cycles
+           FROM (
+               SELECT strategy_name, sum(total_trades) as total_trades, trading_date
+               FROM backtest_runs
+               GROUP BY strategy_name, trading_date
+               ORDER BY trading_date DESC
+           ) sub
+           GROUP BY strategy_name''',
+        fetch='all',
+    )
+    for cr in (cycle_rows or []):
+        name = cr['strategy_name'] if isinstance(cr, dict) else cr[0]
+        zero = cr['zero_cycles'] if isinstance(cr, dict) else cr[1]
+        total = cr['total_cycles'] if isinstance(cr, dict) else cr[2]
+        zero_trade_counts[name] = {'zero': zero, 'total': total}
+
+    for row in rows:
+        name = row['strategy_name']
+        status = row['status']
+        sharpe = float(row['backtest_sharpe'] or 0)
+        win_rate = float(row['backtest_win_rate'] or 0)
+        total_return = float(row['backtest_total_return'] or 0)
+        last_bt = row['last_backtest_at']
+        paper_sharpe = float(row['paper_sharpe'] or 0) if row.get('paper_sharpe') else None
+
+        # ── Backtest → Paper Trading ──
+        if status == 'backtest':
+            gates = PROMOTION_GATES['to_paper']
+
+            # Check freshness
+            if last_bt:
+                days_since = (now - last_bt).days if isinstance(last_bt, datetime) else 999
+            else:
+                days_since = 999
+
+            # Check zero-trade retirement
+            ztc = zero_trade_counts.get(name, {})
+            if ztc.get('total', 0) >= DEMOTION_RULES['zero_trade_cycles'] and ztc.get('zero', 0) == ztc.get('total', 0):
+                reason = f"Retired: {ztc['zero']}/{ztc['total']} backtest cycles produced zero trades"
+                if not dry_run:
+                    _rotate(db, name, 'backtest', 'retired', reason, now_str)
+                actions['retired'].append({'name': name, 'reason': reason})
+                logger.info(f"  {name}: RETIRED — {reason}")
+                continue
+
+            # Check promotion
+            # Need backtest_runs data to count trades
+            trade_count_row = db.execute(
+                '''SELECT COALESCE(sum(total_trades), 0) as trades
+                   FROM backtest_runs
+                   WHERE strategy_name = %s
+                     AND created_at > %s''',
+                (name, (now - timedelta(days=gates['max_days_since_backtest'])).isoformat()),
+                fetch='one',
+            )
+            recent_trades = int(trade_count_row['trades']) if trade_count_row else 0
+
+            if (sharpe >= gates['min_sharpe'] and
+                win_rate >= gates['min_win_rate'] and
+                recent_trades >= gates['min_trades'] and
+                days_since <= gates['max_days_since_backtest']):
+
+                reason = (
+                    f"Auto-promoted: sharpe={sharpe:+.2f}, wr={win_rate:.1%}, "
+                    f"{recent_trades} trades in last {gates['max_days_since_backtest']}d"
+                )
+                if not dry_run:
+                    _rotate(db, name, 'backtest', 'paper_trading', reason, now_str)
+                actions['promoted'].append({'name': name, 'reason': reason})
+                logger.info(f"  {name}: PROMOTED to paper_trading — {reason}")
+            else:
+                actions['unchanged'].append({
+                    'name': name, 'status': status,
+                    'note': f"sharpe={sharpe:+.2f} wr={win_rate:.1%} trades={recent_trades} days={days_since}"
+                })
+
+        # ── Paper Trading → Live (future) ──
+        elif status == 'paper_trading':
+            # For now, just check if paper metrics exist and are positive
+            if paper_sharpe is not None:
+                gates = PROMOTION_GATES['to_live']
+                if (paper_sharpe >= gates['min_paper_sharpe'] and
+                    float(row.get('paper_win_rate') or 0) >= gates['min_paper_win_rate']):
+                    reason = f"Ready for live: paper_sharpe={paper_sharpe:+.2f}"
+                    actions['promoted'].append({'name': name, 'reason': reason, 'to': 'live'})
+                    logger.info(f"  {name}: READY for live — {reason}")
+                    # Don't auto-promote to live — that requires human approval
+            actions['unchanged'].append({'name': name, 'status': status})
+
+        # ── Review → Backtest or Retire ──
+        elif status == 'review':
+            demoted_at = row.get('demoted_at')
+            if demoted_at and isinstance(demoted_at, datetime):
+                days_in_review = (now - demoted_at).days
+                if days_in_review > DEMOTION_RULES['max_review_days']:
+                    reason = f"Retired: in review for {days_in_review} days (max {DEMOTION_RULES['max_review_days']})"
+                    if not dry_run:
+                        _rotate(db, name, 'review', 'retired', reason, now_str)
+                    actions['retired'].append({'name': name, 'reason': reason})
+                    logger.info(f"  {name}: RETIRED — {reason}")
+                    continue
+            actions['unchanged'].append({'name': name, 'status': status})
+
+        # ── Retired — no action ──
+        elif status == 'retired':
+            actions['unchanged'].append({'name': name, 'status': status})
+
+    # Store rotation report in agent_memory
+    _store_rotation_report(db, actions, now_str)
+
+    return actions
+
+
+def _rotate(db, strategy_name: str, from_status: str, to_status: str,
+            reason: str, timestamp: str):
+    """Apply a status rotation."""
+    update_fields = {'status': to_status, 'updated_at': timestamp}
+
+    if to_status == 'paper_trading':
+        update_fields['promoted_at'] = timestamp
+    elif to_status in ('review', 'retired'):
+        update_fields['demoted_at'] = timestamp
+        update_fields['review_notes'] = reason
+
+    set_clause = ', '.join(f'{k} = %s' for k in update_fields)
+    values = list(update_fields.values()) + [strategy_name]
+
+    db.execute(
+        f'UPDATE strategy_roster SET {set_clause} WHERE strategy_name = %s',
+        tuple(values),
+    )
+
+    db.execute(
+        '''INSERT INTO strategy_rotation_log
+           (strategy_name, from_status, to_status, reason, rotated_at)
+           VALUES (%s, %s, %s, %s, %s)''',
+        (strategy_name, from_status, to_status, reason, timestamp),
+    )
+
+
+def _store_rotation_report(db, actions: dict, timestamp: str):
+    """Store rotation actions in agent_memory for RAG."""
+    import json as _json
+    promoted = actions.get('promoted', [])
+    demoted = actions.get('demoted', [])
+    retired = actions.get('retired', [])
+
+    if not promoted and not demoted and not retired:
+        return  # Nothing interesting to record
+
+    lines = []
+    for a in promoted:
+        lines.append(f"PROMOTED {a['name']}: {a['reason']}")
+    for a in demoted:
+        lines.append(f"DEMOTED {a['name']}: {a['reason']}")
+    for a in retired:
+        lines.append(f"RETIRED {a['name']}: {a['reason']}")
+
+    content = f"Strategy rotation: {len(promoted)} promoted, {len(demoted)} demoted, {len(retired)} retired\n\n" + "\n".join(lines)
+
+    try:
+        db.execute(
+            """INSERT INTO agent_memory
+               (agent_name, category, content, metadata, created_at, updated_at)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            ('strategy-rotation', 'rotation-report', content,
+             _json.dumps(actions, default=str), timestamp, timestamp),
+        )
+    except Exception as e:
+        logger.warning(f"Could not store rotation report: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Falcon Strategy Seeder & Rotation Manager',
@@ -424,6 +655,10 @@ Examples:
     )
     parser.add_argument('--backtest', action='store_true',
                         help='Seed strategies and run initial backtests')
+    parser.add_argument('--rotate', action='store_true',
+                        help='Apply automated promotion/demotion gates')
+    parser.add_argument('--rotate-dry-run', action='store_true',
+                        help='Show what rotation would do without applying')
     parser.add_argument('--status', action='store_true',
                         help='Show strategy roster with metrics')
     parser.add_argument('--promote', metavar='STRATEGY',
@@ -446,6 +681,24 @@ Examples:
 
     try:
         if args.status:
+            show_status(db)
+        elif args.rotate or args.rotate_dry_run:
+            print("Running automated rotation gates...")
+            actions = auto_rotate(db, dry_run=args.rotate_dry_run)
+            mode = " (DRY RUN)" if args.rotate_dry_run else ""
+            print(f"\nRotation{mode}:")
+            print(f"  Promoted: {len(actions['promoted'])}")
+            print(f"  Demoted:  {len(actions.get('demoted', []))}")
+            print(f"  Retired:  {len(actions['retired'])}")
+            for a in actions['promoted']:
+                print(f"  [+] {a['name']}: {a['reason']}")
+            for a in actions.get('demoted', []):
+                print(f"  [-] {a['name']}: {a['reason']}")
+            for a in actions['retired']:
+                print(f"  [x] {a['name']}: {a['reason']}")
+            if not actions['promoted'] and not actions.get('demoted') and not actions['retired']:
+                print("  No rotations needed.")
+            print()
             show_status(db)
         elif args.promote:
             promote_strategy(db, args.promote)
