@@ -272,8 +272,19 @@ class DataSyncPipeline:
                 cursor.execute(f"CREATE TEMP TABLE _staging (LIKE {table})")
 
                 # Write DataFrame to CSV buffer
+                # Integer-typed columns (volume, trades) can arrive fractional in
+                # flat files (e.g. adjusted volume); round to int so COPY into the
+                # bigint columns succeeds. NaN -> NULL via nullable Int64.
+                out = df[columns].copy()
+                for int_col in ("volume", "trades"):
+                    if int_col in out.columns:
+                        out[int_col] = (
+                            pd.to_numeric(out[int_col], errors="coerce")
+                            .round()
+                            .astype("Int64")
+                        )
                 buf = io.StringIO()
-                df[columns].to_csv(buf, index=False, header=True)
+                out.to_csv(buf, index=False, header=True)
                 buf.seek(0)
 
                 # COPY into staging
