@@ -152,7 +152,12 @@ class PolygonClient:
         while True:
             data = self._request(endpoint, params)
 
-            if data.get('status') != 'OK':
+            # Accept 'DELAYED' (and a missing status) as data-bearing. This account's
+            # aggregates endpoint returns status='DELAYED' (15-min tier) with FULL
+            # valid results; the prior `!= 'OK'` gate discarded them. Mirrors
+            # squawk_feed.py:346 exactly. NOTE: DELAYED bars must NEVER be labeled
+            # LIVE downstream — they are ~15-min delayed.
+            if data.get('status') not in ('OK', 'DELAYED', None):
                 error = data.get('error', 'Unknown error')
                 logger.warning(f"Polygon API error for {symbol}: {error}")
                 break
@@ -191,8 +196,10 @@ class PolygonClient:
         }
         df = df.rename(columns=column_map)
 
-        # Convert timestamp from milliseconds to datetime
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # Convert timestamp from milliseconds to datetime (tz-aware UTC). Polygon
+        # epoch-ms are UTC; making the index tz-aware here keeps _filter_market_hours'
+        # tz_localize('UTC') guard a no-op and prevents silent window shifts.
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
         df = df.set_index('timestamp')
 
         # Ensure required columns exist

@@ -51,26 +51,119 @@ def _get_db():
     return db
 
 
+def _coerce(value, default=None):
+    """Coerce DB Decimal/None to float, leaving non-numerics alone."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _build_backtest_results(store, name):
+    """Build a rich backtest_results dict from the populated backtest_runs table.
+
+    Pulls aggregates from get_strategy_summary(days=90) and per-symbol/per-day
+    detail from get_recent_backtests(days=90). Returns None if there is no
+    backtest_runs data for this strategy (caller skips it — never a stub).
+    """
+    summary = store.get_strategy_summary(name, days=90) or {}
+    recent = store.get_recent_backtests(strategy_name=name, days=90, limit=500) or []
+
+    total_trades = summary.get('total_trades')
+    if (not summary or total_trades in (None, 0)) and not recent:
+        return None
+
+    # Per-symbol rollup from recent rows
+    per_symbol_map = {}
+    n_signals_total = 0
+    intervals = set()
+    trading_dates = []
+    for r in recent:
+        sym = r.get('symbol')
+        nt = int(r.get('total_trades') or 0)
+        sc = int(r.get('signals_count') or 0)
+        wr = _coerce(r.get('win_rate'))
+        tr = _coerce(r.get('total_return'))
+        n_signals_total += sc
+        if r.get('interval'):
+            intervals.add(r.get('interval'))
+        if r.get('trading_date'):
+            trading_dates.append(str(r.get('trading_date')))
+        acc = per_symbol_map.setdefault(
+            sym, {'symbol': sym, 'n_trades': 0, 'signals_count': 0,
+                  '_wr_sum': 0.0, '_wr_n': 0, '_ret_sum': 0.0, '_ret_n': 0}
+        )
+        acc['n_trades'] += nt
+        acc['signals_count'] += sc
+        if wr is not None:
+            acc['_wr_sum'] += wr
+            acc['_wr_n'] += 1
+        if tr is not None:
+            acc['_ret_sum'] += tr
+            acc['_ret_n'] += 1
+
+    per_symbol = []
+    for sym, acc in per_symbol_map.items():
+        per_symbol.append({
+            'symbol': sym,
+            'n_trades': acc['n_trades'],
+            'signals_count': acc['signals_count'],
+            'win_rate': (acc['_wr_sum'] / acc['_wr_n']) if acc['_wr_n'] else None,
+            'total_return': (acc['_ret_sum'] / acc['_ret_n']) if acc['_ret_n'] else None,
+        })
+
+    if total_trades in (None, 0):
+        total_trades = sum(p['n_trades'] for p in per_symbol)
+
+    avg_return = _coerce(summary.get('avg_return'))
+    win_rate = _coerce(summary.get('avg_win_rate'))
+    expectancy = (avg_return / total_trades) if (total_trades and avg_return is not None) else None
+    total_R = (avg_return * len(per_symbol)) if avg_return is not None else None
+
+    date_span = None
+    if trading_dates:
+        date_span = {'start': min(trading_dates), 'end': max(trading_dates)}
+
+    return {
+        'n_trades': total_trades,
+        'n_signals': n_signals_total,
+        'win_rate': win_rate,
+        'mean_R': expectancy,
+        'expectancy': expectancy,
+        'total_return': avg_return,
+        'total_R': total_R,
+        'max_drawdown': _coerce(summary.get('avg_drawdown')),
+        'sharpe_ratio': _coerce(summary.get('avg_sharpe')),
+        'interval': sorted(intervals)[0] if intervals else None,
+        'symbols_tested': summary.get('symbols_tested') or len(per_symbol),
+        'date_span': date_span,
+        'per_symbol': per_symbol,
+        'data_source': 'flatfiles',
+    }
+
+
 def cmd_run(args):
     """Analyze strategies and create proposals."""
     from falcon_core.backtesting.advisor import StrategyAdvisor
+    from falcon_core.backtesting.results_api import BacktestResultsStore
 
     db = _get_db()
     advisor = StrategyAdvisor(db, model=args.model)
+    store = BacktestResultsStore(db_manager=db)
 
-    # Get strategies to analyze
+    # Roster is used ONLY to fetch strategy code (metrics come from backtest_runs).
     if args.strategy:
         rows = db.execute(
-            '''SELECT strategy_name, strategy_code, backtest_sharpe,
-                      backtest_win_rate, backtest_total_return
+            '''SELECT strategy_name, strategy_code, symbols, interval
                FROM strategy_roster
                WHERE strategy_name = %s AND strategy_code IS NOT NULL''',
             (args.strategy,), fetch='all'
         )
     else:
         rows = db.execute(
-            '''SELECT strategy_name, strategy_code, backtest_sharpe,
-                      backtest_win_rate, backtest_total_return
+            '''SELECT strategy_name, strategy_code, symbols, interval
                FROM strategy_roster
                WHERE strategy_code IS NOT NULL''',
             fetch='all'
@@ -85,33 +178,58 @@ def cmd_run(args):
     for row in rows:
         name = row['strategy_name'] if isinstance(row, dict) else row[0]
         code = row['strategy_code'] if isinstance(row, dict) else row[1]
-        sharpe = row['backtest_sharpe'] if isinstance(row, dict) else row[2]
-        win_rate = row['backtest_win_rate'] if isinstance(row, dict) else row[3]
-        total_return = row['backtest_total_return'] if isinstance(row, dict) else row[4]
 
         if not code:
             continue
 
-        backtest_results = {
-            'sharpe_ratio': sharpe,
-            'win_rate': win_rate,
-            'total_return': total_return,
-        }
+        # Pull REAL metrics from the populated backtest_runs table.
+        backtest_results = _build_backtest_results(store, name)
+        if backtest_results is None:
+            print(f"\n{name}: skipped: no backtest_runs data")
+            continue
 
-        print(f"\nAnalyzing: {name}...")
+        print(f"\nAnalyzing: {name} "
+              f"(trades={backtest_results['n_trades']}, "
+              f"signals={backtest_results['n_signals']}, "
+              f"win_rate={backtest_results['win_rate']})...")
         proposal = advisor.analyze_and_propose(
             strategy_name=name,
             strategy_code=code,
             backtest_results=backtest_results,
         )
 
-        if proposal:
-            print(f"  Proposal created (cost: ${proposal['api_cost_usd']:.4f})")
-            print(f"  Type: {proposal['proposal_type']}")
-            print(f"  Change: {proposal['change_description'][:80]}...")
-            proposals_created += 1
+        if not proposal:
+            print(f"  No proposal generated (budget, data-sufficiency, or validation gate)")
+            continue
+
+        print(f"  Proposal created (cost: ${proposal['api_cost_usd']:.4f})")
+        print(f"  Type: {proposal['proposal_type']}")
+        print(f"  Change: {proposal['change_description'][:80]}...")
+        proposals_created += 1
+
+        # Close the loop: verify the proposal via flat-file backtest and record
+        # whether it actually beat the current code (drives budget retirement).
+        cmp = advisor.backtest_proposal(proposal['id'])
+        if cmp:
+            cur = cmp.get('current', {}) or {}
+            prop = cmp.get('proposed', {}) or {}
+            improved = (
+                prop.get('total_return') is not None
+                and cur.get('total_return') is not None
+                and prop['total_return'] > cur['total_return']
+            )
+            advisor.cost_tracker.record_improvement(name, improved)
+
+            def _fmt(v):
+                return f"{v:.4f}" if isinstance(v, (int, float)) else "n/a"
+
+            print(f"  Verified (flatfiles): "
+                  f"sharpe {_fmt(cur.get('sharpe'))}->{_fmt(prop.get('sharpe'))}  "
+                  f"win_rate {_fmt(cur.get('win_rate'))}->{_fmt(prop.get('win_rate'))}  "
+                  f"return {_fmt(cur.get('total_return'))}->{_fmt(prop.get('total_return'))}  "
+                  f"=> {'IMPROVED' if improved else 'no improvement'}")
         else:
-            print(f"  No proposal generated (budget or validation issue)")
+            print("  Verification skipped (could not load/backtest proposal)")
 
     print(f"\n{proposals_created} proposals created")
     db.close()
