@@ -138,7 +138,7 @@ class FalconConfig:
 
             # Strategy plugins
             'strategy_dir': str(base_dir / 'strategies'),
-            'advisor_model': 'claude-haiku-4-5-20251001',
+            'advisor_model': 'claude-haiku-4-5',
 
             # Screener
             'finviz_screener_url': '',

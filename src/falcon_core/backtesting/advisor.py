@@ -19,14 +19,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Cost per 1M tokens by model (approximate, USD)
+# Cost per 1M tokens by model (USD). Bare current model ids matching the rest
+# of the repo (falcon-strategies/tools/codify.py uses 'claude-opus-4-8').
 MODEL_COSTS = {
-    'claude-haiku-4-5-20251001': {'input': 1.00, 'output': 5.00},
-    'claude-sonnet-4-5-20250929': {'input': 3.00, 'output': 15.00},
-    'claude-opus-4-20250514': {'input': 15.00, 'output': 75.00},
+    'claude-opus-4-8': {'input': 5.00, 'output': 25.00},
+    'claude-haiku-4-5': {'input': 1.00, 'output': 5.00},
 }
 
-DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
+DEFAULT_MODEL = 'claude-haiku-4-5'
 DEFAULT_MAX_NO_IMPROVEMENT = 5
 
 
@@ -233,9 +233,11 @@ class StrategyAdvisor:
                     "anthropic package required. "
                     "Install with: pip install falcon-core[advisor]"
                 )
-            api_key = os.getenv('CLAUDE_API_KEY')
+            api_key = os.getenv('CLAUDE_API_KEY') or os.getenv('ANTHROPIC_API_KEY')
             if not api_key:
-                raise ValueError("CLAUDE_API_KEY environment variable not set")
+                raise ValueError(
+                    "No API key set: provide CLAUDE_API_KEY or ANTHROPIC_API_KEY"
+                )
             self._client = anthropic.Anthropic(api_key=api_key)
         return self._client
 
@@ -276,6 +278,28 @@ class StrategyAdvisor:
         can_spend, reason = self.cost_tracker.can_spend(strategy_name, estimated_cost)
         if not can_spend:
             logger.info(f"Skipping '{strategy_name}': {reason}")
+            return None
+
+        # Data-sufficiency gate (runs AFTER the dollar pre-check, BEFORE any
+        # Claude call so tiny samples spend zero tokens). Require >= 30 trades
+        # across the suite — fewer is not enough signal to propose a non-overfit
+        # change per the Carver out-of-sample discipline.
+        total_trades = backtest_results.get('n_trades')
+        if total_trades is None:
+            per_symbol = backtest_results.get('per_symbol') or []
+            summed = 0
+            have_any = False
+            for ps in per_symbol:
+                nt = ps.get('n_trades') if isinstance(ps, dict) else None
+                if nt is not None:
+                    summed += int(nt)
+                    have_any = True
+            total_trades = summed if have_any else None
+        if total_trades is None or int(total_trades) < 30:
+            logger.info(
+                f"Skipping '{strategy_name}': insufficient backtest data "
+                f"(total_trades={total_trades} < 30); no Claude call made"
+            )
             return None
 
         if historical_proposals is None:
@@ -516,7 +540,7 @@ class StrategyAdvisor:
                 status = p.get('status', p[2] if not isinstance(p, dict) else '')
                 history_text += f"{i}. [{status}] {desc}\n"
 
-        return f"""Analyze this trading strategy and propose exactly ONE small, targeted improvement.
+        return f"""You are improving a single intraday US-equities strategy using Robert Carver's "Systematic Trading" discipline. Analyze the REAL backtest results below and propose exactly ONE actionable, verifiable improvement.
 
 ## Strategy: {strategy_name}
 
@@ -525,23 +549,34 @@ class StrategyAdvisor:
 {code}
 ```
 
-### Backtest Results
+### Real Backtest Results (from backtest_runs over flat-file/Polygon-Massive data)
 {json.dumps(backtest_results, indent=2, default=str)}
 {history_text}
 
-## Instructions
-1. Diagnose the most impactful weakness in the strategy
-2. Propose exactly ONE change (parameter tweak OR logic change, not both)
-3. Return the COMPLETE modified strategy code (not a diff)
-4. Explain your reasoning
+## How to diagnose (cite the numbers above)
+Classify the regime from the metrics, then tailor the fix to THAT regime:
+- NO-SIGNAL: n_signals (signals_count) is ~0 -> the entry never triggers. Fix = loosen/redefine the ENTRY or threshold so signals actually fire. Do NOT tune exits.
+- NO-CONVERSION: n_signals > 0 but n_trades is ~0 -> signals fire but never convert to trades (filters/confirmation too strict, or sizing rounds to zero). Fix = relax the conversion gate / confirmation / min-size.
+- LOSING-EDGE: n_trades > 0 but win_rate or expectancy/mean_R is negative -> there is activity but no edge. Fix = improve the EXIT, add a FILTER that removes the worst symbols/days, or sharpen the edge. Do NOT just loosen entries.
 
-Respond with JSON:
+State which regime applies and quote the exact n_signals, n_trades, win_rate, and expectancy/mean_R you used.
+
+## Hard constraints (reject any proposal that violates these)
+1. COST SPEED-LIMIT: round-trip cost is ~20bps (0.1% commission + 0.1% slippage as modeled by SimpleBacktestEngine). Any change that increases turnover MUST show the post-change per-trade edge still clears 20bps; prefer changes that REDUCE turnover or raise edge per trade.
+2. SIZING: use volatility-targeted / ATR-based position sizing. NEVER fixed-share sizing and NEVER increase size after a loss (anti-martingale only). If the current code sizes by fixed shares, that is itself a candidate fix.
+3. NO OVERFIT: the backtest window is short (see date_span). Do NOT curve-fit to 1-3 specific days. The change must be justifiable out-of-sample and validated across MULTIPLE days/symbols, not a magic constant tuned to the in-sample window.
+4. ONE CHANGE ONLY: exactly one old->new parameter change OR one single logic edit — not both, not several.
+
+## expected_improvement must be a numeric pass bar
+Name the EXACT metric (expectancy in R / mean_R), the magnitude AND direction (e.g. "expectancy from -0.73R to >= +0.10R"), a MIN-TRADES FLOOR the change must still produce (e.g. ">= 30 trades over the window"), and WHICH symbols/days it should help (cite weak names from per_symbol). This must be concrete enough for an automated backtest to verify. All targets are in R-units / expectancy, never dollar P&L.
+
+## Output (strict JSON only)
 ```json
 {{
     "proposal_type": "param_change" or "code_change",
-    "analysis_summary": "Brief diagnosis of the weakness",
-    "change_description": "What you changed and why",
-    "expected_improvement": "What metric should improve and by roughly how much",
-    "proposed_code": "...complete Python code for the strategy..."
+    "analysis_summary": "Regime classification + the specific numbers (n_signals, n_trades, win_rate, expectancy) that drove it",
+    "change_description": "The exact old->new parameter or single logic edit, and why it fits the regime and respects cost/sizing/overfit constraints",
+    "expected_improvement": "Exact metric (expectancy/R), magnitude+direction, min-trades floor, and which symbols/days it should help",
+    "proposed_code": "...complete Python code for the strategy (full module, not a diff)..."
 }}
 ```"""
