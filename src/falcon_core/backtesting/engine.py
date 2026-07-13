@@ -339,8 +339,8 @@ class SimpleBacktestEngine(BacktestEngine):
         # Expectancy
         expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
 
-        # Build equity curve for risk metrics
-        equity = self._build_equity_curve(trades)
+        # Build daily equity curve for risk metrics
+        equity = self._build_equity_curve(trades, data)
 
         # Risk metrics
         returns = equity.pct_change().dropna()
@@ -380,19 +380,42 @@ class SimpleBacktestEngine(BacktestEngine):
             params_used=strategy.params.to_dict(),
         )
 
-    def _build_equity_curve(self, trades: pd.DataFrame) -> pd.Series:
-        """Build equity curve from trades"""
+    def _build_equity_curve(
+        self, trades: pd.DataFrame, data: pd.DataFrame,
+    ) -> pd.Series:
+        """Build daily equity curve spanning the full backtest period.
+
+        Maps trade P&L to the calendar day each trade exits, then
+        forward-fills so every trading day has an equity value.  This
+        gives a proper daily return series for risk-metric calculations
+        (Sharpe, volatility, drawdown).
+        """
         if trades.empty:
-            return pd.Series([self.initial_capital])
+            return pd.Series(
+                self.initial_capital,
+                index=pd.DatetimeIndex([data.index[0]]),
+            )
 
-        equity = [self.initial_capital]
-        current = self.initial_capital
+        # Build a daily date range covering the data period
+        start = data.index[0]
+        end = data.index[-1]
+        # Normalise to dates so we get one point per calendar day
+        daily_index = pd.bdate_range(
+            start=start.normalize(), end=end.normalize(), freq="B",
+        )
 
+        # Assign each trade's P&L to its exit date
+        pnl_by_day = pd.Series(0.0, index=daily_index)
         for _, trade in trades.iterrows():
-            current += trade['pnl_dollar']
-            equity.append(current)
+            exit_dt = pd.Timestamp(trade["exit_time"]).normalize()
+            # Find the nearest business day in case exit falls on a weekend
+            idx = pnl_by_day.index.get_indexer([exit_dt], method="nearest")
+            if idx[0] >= 0:
+                pnl_by_day.iloc[idx[0]] += trade["pnl_dollar"]
 
-        return pd.Series(equity)
+        # Cumulative equity
+        equity = self.initial_capital + pnl_by_day.cumsum()
+        return equity
 
     def _empty_result(
         self,

@@ -244,7 +244,16 @@ class BaseStrategy(ABC):
 
         # Check trading hours (only block new entries, allow exits through)
         if isinstance(signal.timestamp, datetime):
-            signal_time = signal.timestamp.time()
+            ts = signal.timestamp
+            # Convert UTC-aware timestamps to Eastern for comparison
+            # (Polygon returns UTC; time params are Eastern)
+            if ts.tzinfo is not None:
+                try:
+                    from zoneinfo import ZoneInfo
+                except ImportError:
+                    from backports.zoneinfo import ZoneInfo
+                ts = ts.astimezone(ZoneInfo("America/New_York"))
+            signal_time = ts.time()
             start = datetime.strptime(self.params.trade_start_time, "%H:%M").time()
             end = datetime.strptime(self.params.trade_end_time, "%H:%M").time()
             if signal.signal_type in [SignalType.LONG, SignalType.SHORT]:

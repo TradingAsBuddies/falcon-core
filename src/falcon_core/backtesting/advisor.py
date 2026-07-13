@@ -203,6 +203,45 @@ class CostTracker:
         )
         logger.info("Monthly budgets reset for all active strategies")
 
+    def set_budget(self, strategy_name: str, monthly_budget: float = None,
+                   max_months: int = None, status: str = None):
+        """Update budget parameters for a strategy.
+
+        Args:
+            strategy_name: Strategy to update
+            monthly_budget: New monthly budget in USD (None to keep current)
+            max_months: New max months limit (None to keep current)
+            status: New status ('active', 'paused', 'retired') (None to keep)
+        """
+        # Ensure budget record exists
+        self.get_budget(strategy_name)
+
+        updates = []
+        params = []
+        if monthly_budget is not None:
+            updates.append('monthly_budget_usd = %s')
+            params.append(monthly_budget)
+        if max_months is not None:
+            updates.append('max_months = %s')
+            params.append(max_months)
+        if status is not None:
+            updates.append('status = %s')
+            params.append(status)
+
+        if not updates:
+            return
+
+        updates.append('updated_at = %s')
+        params.append(datetime.now().isoformat())
+        params.append(strategy_name)
+
+        self.db.execute(
+            f'''UPDATE strategy_advisor_budget SET
+                {', '.join(updates)}
+                WHERE strategy_name = %s''',
+            tuple(params)
+        )
+
     def get_all_budgets(self) -> List[Dict]:
         """Get budget status for all strategies."""
         rows = self.db.execute(
@@ -272,7 +311,7 @@ class StrategyAdvisor:
             Proposal dict, or None if budget exceeded or error
         """
         # Pre-flight budget check (~$0.01 per Haiku call)
-        estimated_cost = self.cost_tracker.estimate_cost(self.model, 4000, 2000)
+        estimated_cost = self.cost_tracker.estimate_cost(self.model, 6000, 8000)
         can_spend, reason = self.cost_tracker.can_spend(strategy_name, estimated_cost)
         if not can_spend:
             logger.info(f"Skipping '{strategy_name}': {reason}")
@@ -291,13 +330,15 @@ class StrategyAdvisor:
         try:
             response = client.messages.create(
                 model=self.model,
-                max_tokens=4000,
+                max_tokens=16384,
                 temperature=0.3,
                 system=(
                     "You are an expert quantitative trading strategy developer. "
                     "You analyze trading strategy code and backtest results, "
                     "then propose exactly ONE small, targeted improvement. "
-                    "Always respond with valid JSON."
+                    "Always respond with valid JSON only — no markdown, no ```json fences. "
+                    "The proposed_code field must contain raw Python code as a string, "
+                    "NOT wrapped in markdown code fences."
                 ),
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -307,6 +348,13 @@ class StrategyAdvisor:
 
         # Record usage
         usage = response.usage
+
+        # Check if response was truncated
+        if response.stop_reason == 'max_tokens':
+            logger.warning(
+                f"Response truncated for '{strategy_name}' — "
+                f"hit max_tokens ({usage.output_tokens} output tokens)"
+            )
         cost = self.cost_tracker.record_usage(
             strategy_name=strategy_name,
             service='advisor',
@@ -328,6 +376,7 @@ class StrategyAdvisor:
             proposal_data = json.loads(json_match.group())
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in advisor response for '{strategy_name}': {e}")
+            logger.debug(f"Raw JSON match (first 500): {json_match.group()[:500]!r}")
             return None
 
         proposed_code = proposal_data.get('proposed_code', '')
@@ -335,12 +384,29 @@ class StrategyAdvisor:
             logger.warning(f"No proposed_code in advisor response for '{strategy_name}'")
             return None
 
+        # Fix double-escaped newlines from LLM output
+        # If code has literal \n (two chars) instead of actual newlines, fix it
+        if '\n' not in proposed_code and '\\n' in proposed_code:
+            proposed_code = proposed_code.replace('\\n', '\n').replace('\\t', '\t')
+
+        # Strip markdown code fences that LLMs sometimes include
+        proposed_code = proposed_code.strip()
+        if proposed_code.startswith('```'):
+            # Remove opening fence (with optional language tag)
+            first_newline = proposed_code.index('\n')
+            proposed_code = proposed_code[first_newline + 1:]
+        if proposed_code.endswith('```'):
+            proposed_code = proposed_code[:-3].rstrip()
+
         # Validate proposed code
         from falcon_core.backtesting.strategy_loader import validate_strategy_code
         is_valid, error = validate_strategy_code(proposed_code)
         if not is_valid:
             logger.warning(
                 f"Proposed code for '{strategy_name}' failed validation: {error}"
+            )
+            logger.debug(
+                f"First 200 chars of proposed_code: {proposed_code[:200]!r}"
             )
             return None
 

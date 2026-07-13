@@ -167,6 +167,77 @@ def cmd_reset_monthly(args):
     db.close()
 
 
+def cmd_set_budget(args):
+    """Set budget parameters for a strategy."""
+    from falcon_core.backtesting.advisor import CostTracker
+
+    db = _get_db()
+    tracker = CostTracker(db)
+
+    strategy = args.strategy
+    monthly = args.monthly
+    max_months = args.max_months
+    status = args.status
+
+    if monthly is None and max_months is None and status is None:
+        # No flags — show current budget for this strategy
+        budget = tracker.get_budget(strategy)
+        print(f"\nBudget for '{strategy}':")
+        print(f"  Monthly budget:  ${float(budget.get('monthly_budget_usd', 1.0)):,.2f}")
+        print(f"  Month spent:     ${float(budget.get('current_month_spent_usd', 0)):,.4f}")
+        print(f"  Total spent:     ${float(budget.get('total_spent_usd', 0)):,.4f}")
+        print(f"  Max months:      {budget.get('max_months', 4)}")
+        print(f"  Months active:   {budget.get('months_active', 0)}")
+        print(f"  Status:          {budget.get('status', 'active')}")
+        print(f"  No-improvement:  {budget.get('consecutive_no_improvement', 0)}")
+        db.close()
+        return
+
+    tracker.set_budget(strategy, monthly_budget=monthly,
+                       max_months=max_months, status=status)
+
+    changes = []
+    if monthly is not None:
+        changes.append(f"monthly_budget=${monthly:.2f}")
+    if max_months is not None:
+        changes.append(f"max_months={max_months}")
+    if status is not None:
+        changes.append(f"status={status}")
+
+    print(f"Updated '{strategy}': {', '.join(changes)}")
+    db.close()
+
+
+def cmd_set_all_budgets(args):
+    """Set budget for all strategies at once."""
+    from falcon_core.backtesting.advisor import CostTracker
+
+    db = _get_db()
+    tracker = CostTracker(db)
+    budgets = tracker.get_all_budgets()
+
+    if not budgets:
+        print("No strategies with budgets found. Run 'falcon-advisor run' first.")
+        db.close()
+        return
+
+    for b in budgets:
+        name = b['strategy_name'] if isinstance(b, dict) else b[0]
+        tracker.set_budget(name, monthly_budget=args.monthly,
+                           max_months=args.max_months, status=args.status)
+
+    changes = []
+    if args.monthly is not None:
+        changes.append(f"monthly_budget=${args.monthly:.2f}")
+    if args.max_months is not None:
+        changes.append(f"max_months={args.max_months}")
+    if args.status is not None:
+        changes.append(f"status={args.status}")
+
+    print(f"Updated {len(budgets)} strategies: {', '.join(changes)}")
+    db.close()
+
+
 def cmd_proposals(args):
     """List proposals."""
     db = _get_db()
@@ -221,6 +292,8 @@ Examples:
   falcon-advisor reset-monthly           Reset monthly counters
   falcon-advisor proposals               List pending proposals
   falcon-advisor proposals --status all  List all proposals
+  falcon-advisor set-budget NAME --monthly 5.00  Set monthly budget
+  falcon-advisor set-all-budgets --monthly 2.50  Set budget for all strategies
         """
     )
     subparsers = parser.add_subparsers(dest='command', help='Commands')
@@ -238,6 +311,23 @@ Examples:
     # reset-monthly command
     reset_parser = subparsers.add_parser('reset-monthly', help='Reset monthly budgets')
     reset_parser.set_defaults(func=cmd_reset_monthly)
+
+    # set-budget command
+    sb_parser = subparsers.add_parser('set-budget', help='Set budget for a strategy')
+    sb_parser.add_argument('strategy', help='Strategy name')
+    sb_parser.add_argument('--monthly', type=float, help='Monthly budget in USD')
+    sb_parser.add_argument('--max-months', type=int, help='Max months for advisor')
+    sb_parser.add_argument('--status', choices=['active', 'paused', 'retired'],
+                           help='Budget status')
+    sb_parser.set_defaults(func=cmd_set_budget)
+
+    # set-all-budgets command
+    sab_parser = subparsers.add_parser('set-all-budgets', help='Set budget for all strategies')
+    sab_parser.add_argument('--monthly', type=float, help='Monthly budget in USD')
+    sab_parser.add_argument('--max-months', type=int, help='Max months for advisor')
+    sab_parser.add_argument('--status', choices=['active', 'paused', 'retired'],
+                            help='Budget status')
+    sab_parser.set_defaults(func=cmd_set_all_budgets)
 
     # proposals command
     prop_parser = subparsers.add_parser('proposals', help='List proposals')
