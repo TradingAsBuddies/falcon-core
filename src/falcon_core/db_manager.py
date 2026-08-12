@@ -221,7 +221,8 @@ class DatabaseManager:
                     quantity REAL NOT NULL,
                     entry_price REAL NOT NULL,
                     entry_date TEXT NOT NULL,
-                    last_updated TEXT NOT NULL
+                    last_updated TEXT NOT NULL,
+                    stop_loss REAL
                 )
             '''
         else:  # postgresql
@@ -231,7 +232,8 @@ class DatabaseManager:
                     quantity DECIMAL(15,4) NOT NULL,
                     entry_price DECIMAL(15,2) NOT NULL,
                     entry_date TIMESTAMP NOT NULL,
-                    last_updated TIMESTAMP NOT NULL
+                    last_updated TIMESTAMP NOT NULL,
+                    stop_loss DECIMAL(15,2)
                 )
             '''
 

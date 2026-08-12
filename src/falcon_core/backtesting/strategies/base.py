@@ -77,7 +77,7 @@ class StrategyParams:
     # Filters
     min_volume: int = 100000  # Minimum volume filter
     min_price: float = 1.0  # Minimum price filter
-    max_price: float = 500.0  # Maximum price filter
+    max_price: Optional[float] = None  # Maximum price filter; None = uncapped
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization"""
@@ -263,7 +263,7 @@ class BaseStrategy(ABC):
         # Check price filters
         if signal.price < self.params.min_price:
             return False
-        if signal.price > self.params.max_price:
+        if self.params.max_price is not None and signal.price > self.params.max_price:
             return False
 
         # Check confidence threshold
