@@ -45,6 +45,12 @@ class DataSyncPipeline:
                       'volume', 'trades']
     MINUTE_COLUMNS_OPTIONAL = ['vwap']
 
+    # Columns stored as integers (volume bigint, trades integer). The flat
+    # files deliver these as floats — volume arrives as e.g. 1199335.412882 —
+    # and COPY has no implicit float-to-bigint cast, so a single fractional
+    # value aborts the whole day's load rather than the one row.
+    INTEGER_COLUMNS = {'volume', 'trades'}
+
     def __init__(self, db, flat_client):
         """
         Args:
@@ -253,6 +259,35 @@ class DataSyncPipeline:
         return self._bulk_load(df, 'minute_bars', columns,
                                conflict_cols=['symbol', 'timestamp'])
 
+    def _coerce_integer_columns(self, df: pd.DataFrame,
+                                columns: List[str]) -> pd.DataFrame:
+        """Round integer-typed columns so COPY accepts them.
+
+        Values that cannot be read as a number at all become NULL rather than
+        aborting the load, so one malformed field costs a value instead of a
+        day. Uses the nullable Int64 dtype so missing values still write as
+        empty (NULL) rather than as a float NaN.
+        """
+        int_cols = [c for c in columns if c in self.INTEGER_COLUMNS]
+        if not int_cols:
+            return df
+
+        df = df.copy()
+        for col in int_cols:
+            already_missing = df[col].isna()
+            numeric = pd.to_numeric(df[col], errors='coerce')
+
+            unreadable = int((numeric.isna() & ~already_missing).sum())
+            if unreadable:
+                logger.warning(
+                    f"{col}: {unreadable} value(s) were not numeric and "
+                    f"were loaded as NULL"
+                )
+
+            df[col] = numeric.round().astype('Int64')
+
+        return df
+
     def _bulk_load(self, df: pd.DataFrame, table: str, columns: List[str],
                    conflict_cols: List[str]) -> int:
         """
@@ -264,6 +299,8 @@ class DataSyncPipeline:
         """
         if df.empty:
             return 0
+
+        df = self._coerce_integer_columns(df, columns)
 
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
