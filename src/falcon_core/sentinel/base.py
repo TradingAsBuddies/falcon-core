@@ -102,6 +102,8 @@ class SentinelRunner:
         # Each import is wrapped so one broken sentinel doesn't block the rest.
         sentinel_factories = [
             ("falcon_core.sentinel.check_database", "DatabaseSentinel"),
+            ("falcon_core.sentinel.check_freshness", "DataFreshnessSentinel"),
+            ("falcon_core.sentinel.check_freshness", "PipelineFreshnessSentinel"),
             ("falcon_core.sentinel.check_data_feed", "DataFeedSentinel"),
             ("falcon_core.sentinel.check_data_feed", "DataFeedMinuteSentinel"),
             ("falcon_core.sentinel.check_data_feed", "PolygonMinuteSentinel"),
