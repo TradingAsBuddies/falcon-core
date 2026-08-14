@@ -81,6 +81,26 @@ class ProposalReviewer:
     SHARPE_IMPROVEMENT_THRESHOLD = 0.1  # Sharpe must improve by at least this
     WIN_RATE_DECLINE_TOLERANCE = 0.05  # Allow up to 5% win rate decline if Sharpe improves
 
+    # Guards added after this agent applied a change to opening_range_breakout
+    # on 2026-08-11 purely because Sharpe "improved" by +24.82. That change cut
+    # the strategy from 10 trades to 4 and *reduced* return from +2.57% to
+    # +2.07%. Every one of these would have stopped it.
+
+    # A Sharpe this far from plausible is a broken measurement, not a discovery.
+    MAX_PLAUSIBLE_SHARPE = 4.0
+
+    # Fewer trades than this and the comparison is noise, whatever the ratios say.
+    MIN_TRADES_FOR_COMPARISON = 5
+
+    # Losing more than this share of the trade count is a different strategy,
+    # not a better one — the sample shrinks until the metrics stop meaning
+    # anything. Flag for a human instead of applying.
+    MAX_TRADE_COUNT_DECLINE = 0.34
+
+    # Never auto-approve a change that makes the actual return materially worse,
+    # however flattering the risk-adjusted figure looks.
+    MAX_RETURN_DECLINE = 0.002
+
     def __init__(self, db_manager, auto_apply: bool = True):
         """
         Args:
@@ -369,11 +389,58 @@ class ProposalReviewer:
         wr_delta = improvement.get('win_rate', 0)
         return_delta = improvement.get('total_return', 0)
 
-        # Clear improvement: Sharpe up and win rate not significantly worse
-        if sharpe_delta > self.SHARPE_IMPROVEMENT_THRESHOLD and wr_delta >= -self.WIN_RATE_DECLINE_TOLERANCE:
+        # ── Sanity guards, before any approval path ──
+
+        # An implausible Sharpe on either side means the metric is broken. Do
+        # not reason about the delta between two numbers when one of them is
+        # not a measurement.
+        for label, metrics in (('current', current), ('proposed', proposed)):
+            sharpe = metrics.get('sharpe', 0)
+            if abs(sharpe) > self.MAX_PLAUSIBLE_SHARPE:
+                return 'flagged', (
+                    f"{label} Sharpe {sharpe:+.2f} exceeds the plausible ceiling "
+                    f"({self.MAX_PLAUSIBLE_SHARPE}) — treat as a metric fault and "
+                    f"review by hand, do not apply"
+                )
+
+        # Too few trades on either side to compare ratios meaningfully.
+        if min(cur_trades, prop_trades) < self.MIN_TRADES_FOR_COMPARISON:
+            return 'flagged', (
+                f"Too few trades to judge: current {cur_trades}, proposed "
+                f"{prop_trades} (need {self.MIN_TRADES_FOR_COMPARISON} on both sides)"
+            )
+
+        # A large drop in trade count shrinks the sample until the ratios stop
+        # describing anything, and flatters every risk-adjusted metric.
+        if cur_trades > 0:
+            decline = (cur_trades - prop_trades) / cur_trades
+            if decline > self.MAX_TRADE_COUNT_DECLINE:
+                return 'flagged', (
+                    f"Trade count falls {decline:.0%} ({cur_trades} to {prop_trades}) — "
+                    f"a smaller sample, not necessarily a better strategy "
+                    f"(sharpe {sharpe_delta:+.2f}, return {return_delta:+.2%})"
+                )
+
+        # ── Approval paths ──
+
+        # Clear improvement: Sharpe up, win rate not significantly worse, and
+        # actual return not materially worse. The return condition is the one
+        # that matters — a risk-adjusted gain bought with real money is not a
+        # gain.
+        if (sharpe_delta > self.SHARPE_IMPROVEMENT_THRESHOLD
+                and wr_delta >= -self.WIN_RATE_DECLINE_TOLERANCE
+                and return_delta >= -self.MAX_RETURN_DECLINE):
             return 'approved', (
                 f"Sharpe improved by {sharpe_delta:+.2f} "
                 f"(wr {wr_delta:+.1%}, return {return_delta:+.2%})"
+            )
+
+        # Sharpe improved but the return went backwards — exactly the shape of
+        # the 2026-08-11 misfire. Surface it rather than acting on it.
+        if sharpe_delta > self.SHARPE_IMPROVEMENT_THRESHOLD and return_delta < -self.MAX_RETURN_DECLINE:
+            return 'flagged', (
+                f"Sharpe improved {sharpe_delta:+.2f} but return fell "
+                f"{return_delta:+.2%} — risk-adjusted gain paid for in returns"
             )
 
         # Clear degradation: both Sharpe and win rate worse

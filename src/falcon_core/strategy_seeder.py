@@ -168,14 +168,24 @@ def run_backtests(db) -> Dict[str, Any]:
     end_date = date_type.today() - timedelta(days=1)  # Yesterday (data lag)
     start_date = end_date - timedelta(days=42)  # ~30 trading days
 
-    # Get all strategies in backtest status
+    # Strategies whose backtest metrics should be kept current.
+    #
+    # paper_trading is included deliberately. Restricting this to 'backtest'
+    # meant a strategy stopped being re-measured the moment it was promoted, so
+    # whatever number promoted it was frozen on the roster indefinitely — which
+    # is how opening_range_breakout sat at a Sharpe of 25.98 for months after
+    # the metric that produced it had been shown to be wrong. It also leaves
+    # the paper→live gate with nothing fresh to reason about.
+    ACTIVE_STATUSES = ('backtest', 'paper_trading')
+
     rows = db.execute(
-        'SELECT strategy_name, symbols, interval, params FROM strategy_roster WHERE status = %s',
-        ('backtest',), fetch='all'
+        'SELECT strategy_name, symbols, interval, params FROM strategy_roster '
+        'WHERE status = ANY(%s)',
+        (list(ACTIVE_STATUSES),), fetch='all'
     )
 
     if not rows:
-        logger.info("No strategies in 'backtest' status to run")
+        logger.info(f"No strategies in {ACTIVE_STATUSES} to run")
         return results
 
     for row in rows:
@@ -199,6 +209,12 @@ def run_backtests(db) -> Dict[str, Any]:
         all_win_rates = []
         all_sharpes = []
         total_trades = 0
+        # Summed across symbols so the aggregate profit factor is computed from
+        # the parts. Averaging per-symbol ratios would give a different — and
+        # wrong — number.
+        total_gross_profit = 0.0
+        total_gross_loss = 0.0
+        reliable_symbols = 0
 
         for symbol in symbols:
             try:
@@ -223,6 +239,10 @@ def run_backtests(db) -> Dict[str, Any]:
                 if hasattr(result, 'sharpe_ratio') and result.sharpe_ratio is not None:
                     all_sharpes.append(result.sharpe_ratio)
                 total_trades += result.total_trades
+                total_gross_profit += float(getattr(result, 'gross_profit', 0.0) or 0.0)
+                total_gross_loss += float(getattr(result, 'gross_loss', 0.0) or 0.0)
+                if getattr(result, 'metrics_reliable', False):
+                    reliable_symbols += 1
 
                 logger.info(
                     f"    {symbol}: {result.total_return:.2%} return, "
@@ -256,8 +276,20 @@ def run_backtests(db) -> Dict[str, Any]:
             avg_return = float(sum(all_returns) / len(all_returns))
             avg_win_rate = float(sum(all_win_rates) / len(all_win_rates))
             avg_sharpe = float(sum(all_sharpes) / len(all_sharpes)) if all_sharpes else 0.0
-            # Profit factor approximation from win rate and R/R
-            profit_factor = float((avg_win_rate * 2) / (1 - avg_win_rate)) if avg_win_rate < 1 else 10.0
+
+            # Real profit factor, from summed gross P&L across symbols. This
+            # previously discarded the engine's figure and substituted
+            # (win_rate * 2) / (1 - win_rate), which assumes a fixed 2:1
+            # reward-to-risk that nothing here guarantees — so the roster and
+            # dashboard were showing a number derived from win rate alone.
+            #
+            # None when there were no losing trades: the ratio is undefined,
+            # not enormous. The column is nullable and the status table already
+            # renders None as "---".
+            if total_gross_loss > 0:
+                profit_factor = float(total_gross_profit / total_gross_loss)
+            else:
+                profit_factor = None
 
             now = datetime.now().isoformat()
             db.execute(
@@ -277,8 +309,11 @@ def run_backtests(db) -> Dict[str, Any]:
                 'avg_win_rate': avg_win_rate,
                 'avg_sharpe': avg_sharpe,
                 'profit_factor': profit_factor,
+                'gross_profit': total_gross_profit,
+                'gross_loss': total_gross_loss,
                 'total_trades': total_trades,
                 'symbols_tested': len(all_returns),
+                'reliable_symbols': reliable_symbols,
             }
 
             logger.info(
@@ -419,10 +454,17 @@ def demote_strategy(db, strategy_name: str, reason: str = ""):
 PROMOTION_GATES = {
     # backtest → paper_trading
     'to_paper': {
-        'min_sharpe': 0.0,           # Must be non-negative
+        # Strictly positive. At 0.0 a strategy whose Sharpe was suppressed for
+        # having too few observations would have satisfied the gate, which is
+        # the opposite of what the guard is for.
+        'min_sharpe': 0.05,
         'min_win_rate': 0.20,        # At least 20% win rate
         'min_trades': 5,             # At least 5 trades in backtest
         'max_days_since_backtest': 7,  # Backtested in last 7 days
+        # Above this, disbelieve the number rather than act on it. Sustained
+        # Sharpe over ~4 is not a finding, it is a bug — the review agent
+        # applied a change on a reported 25.98 before this existed.
+        'max_plausible_sharpe': 4.0,
     },
     # paper_trading → live  (future — requires paper trading metrics)
     'to_live': {
@@ -524,6 +566,21 @@ def auto_rotate(db, dry_run: bool = False) -> Dict[str, Any]:
                 fetch='one',
             )
             recent_trades = int(trade_count_row['trades']) if trade_count_row else 0
+
+            # An implausibly high Sharpe means the measurement is broken, not
+            # that the strategy is exceptional. Hold it for a human instead of
+            # promoting on it.
+            if sharpe > gates['max_plausible_sharpe']:
+                note = (
+                    f"HELD: sharpe={sharpe:+.2f} exceeds the plausible ceiling "
+                    f"({gates['max_plausible_sharpe']}) on {recent_trades} trades — "
+                    f"treat as a metric fault, not a promotion candidate"
+                )
+                actions['unchanged'].append({
+                    'name': name, 'status': status, 'note': note,
+                })
+                logger.warning(f"  {name}: {note}")
+                continue
 
             if (sharpe >= gates['min_sharpe'] and
                 win_rate >= gates['min_win_rate'] and
