@@ -62,7 +62,8 @@ class DataFeed:
         self._cache: Dict[str, pd.DataFrame] = {}
         self._polygon_client = None
         self._flatfiles_client = None
-        self._polygon_api_key = polygon_api_key or os.getenv('POLYGON_API_KEY')
+        # Massive is the current vendor name; POLYGON_API_KEY kept as legacy alias
+        self._polygon_api_key = polygon_api_key or os.getenv('MASSIVE_API_KEY') or os.getenv('POLYGON_API_KEY')
         self._massive_access_key = massive_access_key or os.getenv('MASSIVE_ACCESS_KEY')
         self._massive_secret_key = massive_secret_key or os.getenv('MASSIVE_SECRET_KEY')
 
