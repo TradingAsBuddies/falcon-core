@@ -29,6 +29,21 @@ observed in the prior year (NYSE does not close December 31).
 Early closes (13:00 ET): July 3rd when Independence Day is observed on a
 weekday, the Friday after Thanksgiving, and Christmas Eve when it falls
 Monday-Thursday.
+
+Known limitation -- ad-hoc closures
+-----------------------------------
+Rules cannot express one-off closures the exchange declares for a national day
+of mourning, a hurricane, or an emergency. Recent examples: 2025-01-09 (funeral
+of President Carter), 2018-12-05 (President Bush), 2012-10-29/30 (Hurricane
+Sandy). This module therefore reports 251 sessions for 2025 where the NYSE
+actually held 250.
+
+The consequence is bounded and one-directional: a day that was closed is
+reported as *open*. For the gating this module was written for that is the safe
+direction -- a trading loop simply finds no data and does nothing -- but a
+backtest window spanning such a date will show one session of missing bars, and
+the data-feed sentinel will report it. Add confirmed ad-hoc closures to
+``AD_HOC_CLOSURES`` as they occur.
 """
 
 from __future__ import annotations
@@ -64,6 +79,15 @@ _JUNETEENTH_FROM = 2022
 
 #: Guard against an unbounded scan if the rules were ever broken.
 _MAX_SCAN_DAYS = 30
+
+#: One-off closures the exchange declared that no rule can derive. Append as
+#: they happen; see the "Known limitation" note in the module docstring.
+AD_HOC_CLOSURES = frozenset({
+    _dt.date(2025, 1, 9),    # National day of mourning, President Carter
+    _dt.date(2018, 12, 5),   # National day of mourning, President G.H.W. Bush
+    _dt.date(2012, 10, 29),  # Hurricane Sandy
+    _dt.date(2012, 10, 30),  # Hurricane Sandy
+})
 
 
 class MarketCalendarError(RuntimeError):
@@ -232,6 +256,8 @@ def is_session(value) -> bool:
     """True when the US equity market holds a regular session on that date."""
     day = _as_date(value)
     if day.weekday() >= 5:
+        return False
+    if day in AD_HOC_CLOSURES:
         return False
     return day not in _holidays(day.year)
 
