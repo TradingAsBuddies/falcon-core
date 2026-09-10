@@ -28,6 +28,8 @@ Design notes:
 from __future__ import annotations
 
 import logging
+
+from falcon_core import market_calendar
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
@@ -105,11 +107,26 @@ def _validate(payload: Dict) -> Dict:
     start, end = payload.get("start"), payload.get("end")
     if not start or not end:
         raise BacktestRequestError("'start' and 'end' (YYYY-MM-DD) are required")
+    parsed = {}
     for label, value in (("start", start), ("end", end)):
         try:
-            date.fromisoformat(value)
+            parsed[label] = date.fromisoformat(value)
         except (TypeError, ValueError):
             raise BacktestRequestError(f"'{label}' must be an ISO date (YYYY-MM-DD), got {value!r}")
+
+    if parsed["start"] > parsed["end"]:
+        raise BacktestRequestError(
+            f"'start' ({start}) is after 'end' ({end})"
+        )
+
+    # A window containing no trading session can never produce bars. Rejecting it
+    # here keeps it from arriving at the engine, which used to report the empty
+    # load as a 0-trade success (falcon-core#20, #21).
+    if not market_calendar.sessions_between(parsed["start"], parsed["end"]):
+        raise BacktestRequestError(
+            f"window {start}..{end} contains no trading sessions "
+            "(weekend or market holiday)"
+        )
     if end < start:
         raise BacktestRequestError(f"'end' ({end}) is before 'start' ({start})")
 

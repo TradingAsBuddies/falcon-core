@@ -50,6 +50,7 @@ setup(
             "falcon-strategy-seed=falcon_core.strategy_seeder:main",
             "falcon-migrate-strategies=falcon_core.migrate_strategies:main",
             "falcon-advisor=falcon_core.advisor_cli:main",
+            "falcon-feedback-loop=falcon_core.feedback_loop_cli:main",
         ],
     },
     classifiers=[
