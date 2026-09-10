@@ -217,11 +217,94 @@ class CostTracker:
 class StrategyAdvisor:
     """AI-powered strategy analysis and proposal generation."""
 
-    def __init__(self, db, model: str = None):
+    #: Output cap for a proposal. The old 4000 truncated every single response
+    #: (falcon-core#18) -- a proposal carries a full strategy source file, which
+    #: does not fit. Override with FALCON_ADVISOR_MAX_TOKENS.
+    DEFAULT_MAX_TOKENS = 16000
+
+    def __init__(self, db, model: str = None, max_tokens: int = None):
         self.db = db
         self.model = model or os.getenv('FALCON_ADVISOR_MODEL', DEFAULT_MODEL)
+        self.max_tokens = int(
+            max_tokens
+            or os.getenv('FALCON_ADVISOR_MAX_TOKENS', self.DEFAULT_MAX_TOKENS)
+        )
         self.cost_tracker = CostTracker(db)
         self._client = None
+
+    # ------------------------------------------------------------------
+    # response handling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_proposal_json(content: str):
+        """Parse the advisor reply into a dict, or return None.
+
+        Tries the whole string first (correct when the model emitted exactly one
+        JSON object, which the prefilled "{" makes the normal case), then falls
+        back to the outermost brace-delimited span for a reply wrapped in prose
+        or a ```json fence. Deliberately not a bare regex: an unterminated object
+        must fail here rather than appear to be "no JSON at all".
+        """
+        import re
+
+        candidates = [content]
+
+        fenced = re.search(r'```(?:json)?\s*([\s\S]*?)```', content)
+        if fenced:
+            candidates.append(fenced.group(1))
+
+        span = re.search(r'\{[\s\S]*\}', content)
+        if span:
+            candidates.append(span.group())
+
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            try:
+                parsed = json.loads(candidate)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    def _record_failed_proposal(self, strategy_name, reason, stop_reason,
+                                raw_content, cost):
+        """Persist a failed advisor call so the Advisor UI can show it.
+
+        Previously these returned None and vanished, while the API spend was
+        already recorded -- the failure was invisible everywhere except the log
+        (falcon-core#18). The row makes it visible and gives the sentinel
+        something to count.
+        """
+        try:
+            self.db.execute(
+                """INSERT INTO strategy_proposals
+                   (strategy_name, proposal_type, current_code, proposed_code,
+                    analysis_summary, change_description, expected_improvement,
+                    api_cost_usd, created_at, status)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    strategy_name,
+                    'parse_failed',
+                    '',
+                    '',
+                    f'reason={reason}; stop_reason={stop_reason}',
+                    f'Advisor response unusable: {reason}',
+                    None,
+                    cost,
+                    datetime.now().isoformat(),
+                    'parse_failed',
+                ),
+            )
+        except Exception as exc:
+            # Never let bookkeeping take down the advisor run.
+            logger.error(
+                "Could not record parse_failed proposal for '%s': %s",
+                strategy_name, exc,
+            )
 
     def _get_client(self):
         """Lazy-init Anthropic client."""
@@ -315,15 +398,20 @@ class StrategyAdvisor:
         try:
             response = client.messages.create(
                 model=self.model,
-                max_tokens=4000,
+                max_tokens=self.max_tokens,
                 temperature=0.3,
                 system=(
                     "You are an expert quantitative trading strategy developer. "
                     "You analyze trading strategy code and backtest results, "
                     "then propose exactly ONE small, targeted improvement. "
-                    "Always respond with valid JSON."
+                    "Respond with a single valid JSON object and nothing else."
                 ),
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "user", "content": prompt},
+                    # Prefill the opening brace: the reply is then JSON by
+                    # construction rather than something to regex out of prose.
+                    {"role": "assistant", "content": "{"},
+                ],
             )
         except Exception as e:
             logger.error(f"Claude API call failed for '{strategy_name}': {e}")
@@ -340,23 +428,43 @@ class StrategyAdvisor:
             request_type='analyze_and_propose',
         )
 
-        # Parse response
-        content = response.content[0].text
-        import re
-        json_match = re.search(r'\{[\s\S]*\}', content)
-        if not json_match:
-            logger.error(f"Could not parse JSON from advisor response for '{strategy_name}'")
+        # Parse response.
+        #
+        # The reply was prefilled with "{", so put it back before parsing.
+        # max_tokens=4000 used to truncate every answer; the regex could not match
+        # JSON with no closing brace, and the failure returned None while the spend
+        # was already recorded -- months of paid-for, silently discarded proposals
+        # (falcon-core#18). Truncation is now detected explicitly and persisted.
+        stop_reason = getattr(response, 'stop_reason', None)
+        content = '{' + response.content[0].text
+
+        if stop_reason == 'max_tokens':
+            logger.error(
+                "Advisor response for '%s' hit the %d-token cap (stop_reason=max_tokens); "
+                "recording parse_failed", strategy_name, self.max_tokens,
+            )
+            self._record_failed_proposal(
+                strategy_name, 'truncated', stop_reason, content, cost,
+            )
             return None
 
-        try:
-            proposal_data = json.loads(json_match.group())
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in advisor response for '{strategy_name}': {e}")
+        proposal_data = self._parse_proposal_json(content)
+        if proposal_data is None:
+            logger.error(
+                "Could not parse JSON from advisor response for '%s' "
+                "(stop_reason=%s)", strategy_name, stop_reason,
+            )
+            self._record_failed_proposal(
+                strategy_name, 'invalid_json', stop_reason, content, cost,
+            )
             return None
 
         proposed_code = proposal_data.get('proposed_code', '')
         if not proposed_code:
             logger.warning(f"No proposed_code in advisor response for '{strategy_name}'")
+            self._record_failed_proposal(
+                strategy_name, 'no_proposed_code', stop_reason, content, cost,
+            )
             return None
 
         # Validate proposed code
@@ -365,6 +473,10 @@ class StrategyAdvisor:
         if not is_valid:
             logger.warning(
                 f"Proposed code for '{strategy_name}' failed validation: {error}"
+            )
+            self._record_failed_proposal(
+                strategy_name, f'validation_failed: {error}', stop_reason,
+                proposed_code, cost,
             )
             return None
 

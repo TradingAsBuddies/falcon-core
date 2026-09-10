@@ -24,6 +24,8 @@ import os
 import sys
 import json
 import logging
+
+from falcon_core import market_calendar
 import time
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any
@@ -189,15 +191,15 @@ class FeedbackLoopScheduler:
         logger.info(f"Saved config to {self.config_path}")
 
     def _get_previous_trading_day(self) -> date:
-        """Get the previous trading day (skip weekends)"""
+        """Get the previous trading session.
+
+        Holiday-aware. The old implementation subtracted a day and skipped only
+        weekends, so a Monday holiday passed straight through and the scheduler
+        asked the data feed for a session that never happened -- the Labor Day
+        2026-09-07 sentinel failure (falcon-core#20).
+        """
         today = datetime.now(self.TIMEZONE).date()
-        prev_day = today - timedelta(days=1)
-
-        # Skip weekends
-        while prev_day.weekday() >= 5:  # Saturday = 5, Sunday = 6
-            prev_day -= timedelta(days=1)
-
-        return prev_day
+        return market_calendar.previous_session(today)
 
     def _load_strategy(self, strategy_name: str):
         """Load a strategy class by name"""

@@ -22,6 +22,49 @@ from falcon_core.backtesting.strategies.base import BaseStrategy, Signal, Signal
 logger = logging.getLogger(__name__)
 
 
+#: Trading days in a year, and the RTH minutes in a session -- the two constants
+#: every annualization here derives from.
+TRADING_DAYS_PER_YEAR = 252
+RTH_MINUTES_PER_SESSION = 390
+
+
+def _infer_bar_frequency(data: "pd.DataFrame") -> Optional[str]:
+    """Best-effort bar frequency label ('1min', '5min', '1day', ...)."""
+    if data is None or len(data) < 3:
+        return None
+    try:
+        deltas = pd.Series(data.index[1:]) - pd.Series(data.index[:-1])
+        seconds = float(deltas.dt.total_seconds().median())
+    except Exception:
+        return None
+    if seconds <= 0:
+        return None
+    if seconds < 3600:
+        return f"{int(round(seconds / 60))}min"
+    if seconds < 86400:
+        return f"{int(round(seconds / 3600))}h"
+    return f"{int(round(seconds / 86400))}day"
+
+
+def _bars_per_year(data: "pd.DataFrame") -> float:
+    """How many bars of this frequency occur in a trading year.
+
+    Used to annualize volatility at the *bar* frequency. The old code always
+    multiplied by sqrt(252) regardless of whether the bars were daily or
+    one-minute, which is off by sqrt(390) on intraday data (falcon-core#21).
+    """
+    freq = _infer_bar_frequency(data)
+    if not freq:
+        return float(TRADING_DAYS_PER_YEAR)
+    if freq.endswith("min"):
+        per_session = RTH_MINUTES_PER_SESSION / max(int(freq[:-3]), 1)
+    elif freq.endswith("h"):
+        per_session = (RTH_MINUTES_PER_SESSION / 60) / max(int(freq[:-1]), 1)
+    else:
+        per_session = 1.0 / max(int(freq[:-3]), 1)
+    return float(TRADING_DAYS_PER_YEAR) * per_session
+
+
 @dataclass
 class BacktestResult:
     """Results from a backtest run"""
@@ -56,6 +99,15 @@ class BacktestResult:
     avg_trade_duration: float = 0.0  # Days
     avg_position_size: float = 0.0
 
+    # Run provenance. A backtest that loaded nothing and a backtest whose
+    # strategy declined to trade both used to look like "0 trades, success"
+    # (falcon-core#21). These make them distinguishable on every run row.
+    status: str = "ok"          # ok | error
+    reason: Optional[str] = None  # no_data | insufficient_bars | no_signals
+    bars_loaded: int = 0
+    engine_used: str = "simple"
+    bar_frequency: Optional[str] = None
+
     # Raw data
     equity_curve: Optional[pd.Series] = None
     trades: Optional[pd.DataFrame] = None
@@ -88,6 +140,11 @@ class BacktestResult:
             "avg_trade_duration": self.avg_trade_duration,
             "avg_position_size": self.avg_position_size,
             "params_used": self.params_used,
+            "status": self.status,
+            "reason": self.reason,
+            "bars_loaded": self.bars_loaded,
+            "engine_used": self.engine_used,
+            "bar_frequency": self.bar_frequency,
         }
 
     def summary(self) -> str:
@@ -195,6 +252,28 @@ class SimpleBacktestEngine(BacktestEngine):
         symbol: str = "UNKNOWN",
     ) -> BacktestResult:
         """Run simple vectorized backtest"""
+        # A run that loaded no bars is a data failure, not a strategy that chose
+        # not to trade. Reporting the two identically is what let four strategies
+        # sit at "100 runs / 0 trades" and look like a strategy problem
+        # (falcon-core#21).
+        bars = 0 if data is None else len(data)
+        min_bars = getattr(strategy, 'min_bars', 0) or 0
+
+        if bars == 0:
+            logger.error(
+                "Backtest for %s/%s loaded 0 bars", strategy.name, symbol,
+            )
+            return self._error_result(strategy, symbol, 'no_data', bars)
+
+        if bars < min_bars:
+            logger.error(
+                "Backtest for %s/%s loaded %d bars, below the strategy minimum "
+                "of %d", strategy.name, symbol, bars, min_bars,
+            )
+            return self._error_result(
+                strategy, symbol, 'insufficient_bars', bars, data=data,
+            )
+
         # Generate signals
         signals = strategy.run(data, symbol)
 
@@ -312,16 +391,30 @@ class SimpleBacktestEngine(BacktestEngine):
                 benchmark_return=benchmark_return,
                 signals=signals,
                 params_used=strategy.params.to_dict(),
+                status='ok',
+                reason='no_trades',
+                bars_loaded=len(data),
+                engine_used=type(self).__name__,
+                bar_frequency=_infer_bar_frequency(data),
             )
 
         # Calculate returns
         total_pnl = trades['pnl_dollar'].sum()
         total_return = total_pnl / self.initial_capital
 
-        # Annualized return
+        # Annualized return.
+        #
+        # years used to be floored at 0.01 (~3.65 days), so a short intraday
+        # window raised total return to the ~100th power and produced a number
+        # with no meaning. Below one session we simply do not annualize --
+        # reporting the period return is honest; extrapolating it is not
+        # (falcon-core#21).
         days = (end_date - start_date).days
-        years = max(days / 365.25, 0.01)
-        annual_return = ((1 + total_return) ** (1 / years)) - 1
+        years = days / 365.25
+        if years >= (1.0 / TRADING_DAYS_PER_YEAR):
+            annual_return = ((1 + total_return) ** (1 / years)) - 1
+        else:
+            annual_return = total_return
 
         # Win/loss stats
         winning = trades[trades['pnl_pct'] > 0]
@@ -342,12 +435,28 @@ class SimpleBacktestEngine(BacktestEngine):
         # Build equity curve for risk metrics
         equity = self._build_equity_curve(trades)
 
-        # Risk metrics
+        # Risk metrics.
+        #
+        # The equity curve is trade-indexed, so its per-step volatility is
+        # per-trade, not per-day. Scaling it by sqrt(252) while dividing an
+        # annualized return by it mixed two different time bases -- which is why
+        # atr_breakout reported -6.97 on 1914 trades regardless of edge.
+        # Annualize at the actual bar frequency instead, and derive Sharpe from
+        # the same period returns the volatility came from.
         returns = equity.pct_change().dropna()
-        volatility = returns.std() * np.sqrt(252) if len(returns) > 0 else 0
+        periods_per_year = _bars_per_year(data)
 
-        # Sharpe ratio (assuming 0% risk-free rate)
-        sharpe = (annual_return / volatility) if volatility > 0 else 0
+        if len(returns) > 1:
+            period_std = float(returns.std())
+            period_mean = float(returns.mean())
+            volatility = period_std * np.sqrt(periods_per_year)
+            sharpe = (
+                (period_mean / period_std) * np.sqrt(periods_per_year)
+                if period_std > 0 else 0.0
+            )
+        else:
+            volatility = 0.0
+            sharpe = 0.0
 
         # Max drawdown
         rolling_max = equity.expanding().max()
@@ -378,6 +487,11 @@ class SimpleBacktestEngine(BacktestEngine):
             trades=trades,
             signals=signals,
             params_used=strategy.params.to_dict(),
+            status='ok',
+            reason=None,
+            bars_loaded=len(data),
+            engine_used=type(self).__name__,
+            bar_frequency=_infer_bar_frequency(data),
         )
 
     def _build_equity_curve(self, trades: pd.DataFrame) -> pd.Series:
@@ -400,7 +514,12 @@ class SimpleBacktestEngine(BacktestEngine):
         data: pd.DataFrame,
         symbol: str,
     ) -> BacktestResult:
-        """Return empty result for no-signal case"""
+        """Return empty result for the no-signal case.
+
+        This means the data loaded fine and the strategy produced no signal --
+        a legitimate outcome. An empty *data load* goes through
+        :meth:`_error_result` instead.
+        """
         return BacktestResult(
             strategy_name=strategy.name,
             symbol=symbol,
@@ -410,6 +529,37 @@ class SimpleBacktestEngine(BacktestEngine):
             annual_return=0.0,
             benchmark_return=(data['close'].iloc[-1] / data['close'].iloc[0]) - 1,
             params_used=strategy.params.to_dict(),
+            status='ok',
+            reason='no_signals',
+            bars_loaded=len(data),
+            engine_used=type(self).__name__,
+            bar_frequency=_infer_bar_frequency(data),
+        )
+
+    def _error_result(
+        self,
+        strategy: BaseStrategy,
+        symbol: str,
+        reason: str,
+        bars_loaded: int,
+        data: Optional[pd.DataFrame] = None,
+    ) -> BacktestResult:
+        """Return a result flagged as a failed run (falcon-core#21)."""
+        has_rows = data is not None and len(data) > 0
+        return BacktestResult(
+            strategy_name=strategy.name,
+            symbol=symbol,
+            start_date=data.index[0] if has_rows else None,
+            end_date=data.index[-1] if has_rows else None,
+            total_return=0.0,
+            annual_return=0.0,
+            benchmark_return=0.0,
+            params_used=strategy.params.to_dict(),
+            status='error',
+            reason=reason,
+            bars_loaded=bars_loaded,
+            engine_used=type(self).__name__,
+            bar_frequency=_infer_bar_frequency(data) if has_rows else None,
         )
 
 
@@ -448,7 +598,15 @@ class BTBacktestEngine(BacktestEngine):
     ) -> BacktestResult:
         """Run backtest using bt library"""
         if self._bt is None:
-            logger.warning("bt not available, falling back to simple engine")
+            # Loud, not a warning: a caller that asked for the event-driven engine
+            # and silently got the vectorized one has been measuring something
+            # other than what it thinks (falcon-core#21). The returned result
+            # carries engine_used='SimpleBacktestEngine' so the run row is honest.
+            logger.error(
+                "BTBacktestEngine requested but bt/ffn are not installed; "
+                "falling back to SimpleBacktestEngine for %s/%s. Results are "
+                "vectorized, not event-driven.", strategy.name, symbol,
+            )
             simple = SimpleBacktestEngine(
                 self.initial_capital, self.commission, self.slippage
             )

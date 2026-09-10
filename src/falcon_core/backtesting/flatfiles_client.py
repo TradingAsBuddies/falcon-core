@@ -23,6 +23,8 @@ Configuration:
 import os
 import io
 import logging
+
+from falcon_core import market_calendar
 from datetime import datetime, date
 from typing import List, Optional, Union
 from pathlib import Path
@@ -278,9 +280,14 @@ class FlatFilesClient:
         all_data = []
 
         current = start_date
+        skipped_non_sessions = []
         while current <= end_date:
-            # Skip weekends
-            if current.weekday() < 5:
+            # Skip anything that is not a trading session. Weekday-only skipping
+            # meant holiday S3 keys were requested, came back empty, and surfaced
+            # as a hard failure instead of "the market was closed" (falcon-core#20).
+            if not market_calendar.is_session(current):
+                skipped_non_sessions.append(current)
+            else:
                 s3_key = self._get_day_aggs_key(current)
                 df = self._download_file(s3_key, use_cache)
 
@@ -293,7 +300,20 @@ class FlatFilesClient:
 
             current += pd.Timedelta(days=1).to_pytimedelta()
 
+        if skipped_non_sessions:
+            logger.info(
+                "Skipped %d non-session date(s) for %s (weekend/holiday): %s",
+                len(skipped_non_sessions), symbol,
+                ", ".join(d.isoformat() for d in skipped_non_sessions[:5]),
+            )
+
         if not all_data:
+            if skipped_non_sessions and not market_calendar.sessions_between(start_date, end_date):
+                logger.info(
+                    "No daily data for %s: the requested window %s..%s contains "
+                    "no trading sessions", symbol, start_date, end_date,
+                )
+                return pd.DataFrame()
             logger.warning(f"No daily data for {symbol}")
             return pd.DataFrame()
 
@@ -364,8 +384,8 @@ class FlatFilesClient:
         current = start_date
 
         while current <= end_date:
-            # Skip weekends
-            if current.weekday() < 5:
+            # Sessions only -- see the daily loop above (falcon-core#20).
+            if market_calendar.is_session(current):
                 df = self.get_minute_bars(symbol, current, use_cache)
                 if not df.empty:
                     all_data.append(df)

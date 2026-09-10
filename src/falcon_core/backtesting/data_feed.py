@@ -18,11 +18,21 @@ Priority for intraday data:
 
 import os
 import logging
+
+from falcon_core import market_calendar
 from datetime import date, datetime, timedelta, time as dt_time
 from typing import Any, Dict, List, Optional, Union
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+class NoTradingSessionError(ValueError):
+    """Raised when a requested window contains no trading session.
+
+    Subclasses ValueError so existing handlers keep working; callers that care
+    can catch it and report SKIP instead of FAIL (falcon-core#20).
+    """
 
 
 class DataFeed:
@@ -175,6 +185,18 @@ class DataFeed:
             data = self._try_csv(symbol, start_date, end_date, interval)
 
         if data is None or data.empty:
+            # Distinguish "the market was shut" from "the feed is broken".
+            # Both used to raise the same ValueError, so the data-feed sentinel
+            # reported FAIL for the whole week after every market holiday --
+            # Labor Day 2026-09-07 being the case in the review
+            # (falcon-core#20). NoTradingSessionError subclasses ValueError, so
+            # existing `except ValueError` handlers are unaffected; callers that
+            # want to report SKIP can catch it specifically.
+            if not market_calendar.sessions_between(start_date, end_date):
+                raise NoTradingSessionError(
+                    f"No trading session for {symbol} between {start_date} and "
+                    f"{end_date} (weekend or market holiday)"
+                )
             raise ValueError(f"No data found for {symbol} from {start_date} to {end_date}")
 
         # Filter to market hours if requested
