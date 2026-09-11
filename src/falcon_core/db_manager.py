@@ -163,8 +163,17 @@ class DatabaseManager:
             elif fetch == 'all':
                 result = cursor.fetchall()
             elif fetch == 'none':
-                conn.commit()
                 result = cursor.lastrowid if self.db_type == 'sqlite' else cursor.rowcount
+
+            # Commit regardless of `fetch`.
+            #
+            # This used to happen only under fetch='none', which meant any
+            # write that returns rows -- `UPDATE ... RETURNING`, `INSERT ...
+            # RETURNING` -- was rolled back when the connection closed, while
+            # appearing to succeed because the returned row was correct.
+            # Committing after a read is a no-op, so this is safe for the
+            # SELECT paths.
+            conn.commit()
 
             return result
 
@@ -190,7 +199,62 @@ class DatabaseManager:
         self._migrate_strategy_roster_v2()
         self._create_advisor_tables()
         self._create_backtest_results_tables()
+        self._migrate_trading_columns()
         logger.info("Database schema initialized successfully")
+
+    #: Columns the trader writes that the original CREATE TABLE statements
+    #: never declared. They exist in the deployed database because they were
+    #: added out of band, so a fresh deploy did not match production and
+    #: `SELECT initial_balance FROM account` raised (falcon-trader#28).
+    _TRADING_COLUMN_MIGRATIONS = {
+        "positions": {
+            "current_price": {"sqlite": "REAL", "postgresql": "DECIMAL(15,4)"},
+            "stop_loss": {"sqlite": "REAL", "postgresql": "DECIMAL(15,4)"},
+            "profit_target": {"sqlite": "REAL", "postgresql": "DECIMAL(15,4)"},
+            "strategy": {"sqlite": "TEXT", "postgresql": "VARCHAR(50)"},
+        },
+        "account": {
+            "initial_balance": {"sqlite": "REAL", "postgresql": "DECIMAL(15,2)"},
+        },
+    }
+
+    def _existing_columns(self, table: str) -> set:
+        """Column names on `table`, or an empty set if it does not exist."""
+        try:
+            if self.db_type == 'sqlite':
+                rows = self.execute(f"PRAGMA table_info({table})", fetch='all') or []
+                return {r[1] if not isinstance(r, dict) else r['name'] for r in rows}
+            rows = self.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = %s",
+                (table,), fetch='all',
+            ) or []
+            return {r['column_name'] for r in rows}
+        except Exception as exc:
+            logger.warning("Could not inspect columns on %s: %s", table, exc)
+            return set()
+
+    def _migrate_trading_columns(self):
+        """Add any missing trading columns. Idempotent and additive.
+
+        Never drops or retypes anything -- this runs against a live trading
+        database, so the only safe operation is adding a nullable column.
+        """
+        for table, columns in self._TRADING_COLUMN_MIGRATIONS.items():
+            present = self._existing_columns(table)
+            if not present:
+                continue  # table absent; CREATE TABLE above already handled it
+            for name, types in columns.items():
+                if name in present:
+                    continue
+                col_type = types[self.db_type]
+                try:
+                    self.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+                    logger.info("Added %s.%s (%s)", table, name, col_type)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not add %s.%s: %s", table, name, exc,
+                    )
 
     def _create_trading_tables(self):
         """Create paper trading tables"""
@@ -201,7 +265,8 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS account (
                     id INTEGER PRIMARY KEY,
                     cash REAL NOT NULL,
-                    last_updated TEXT NOT NULL
+                    last_updated TEXT NOT NULL,
+                    initial_balance REAL
                 )
             '''
         else:  # postgresql
@@ -209,7 +274,8 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS account (
                     id SERIAL PRIMARY KEY,
                     cash DECIMAL(15,2) NOT NULL,
-                    last_updated TIMESTAMP NOT NULL
+                    last_updated TIMESTAMP NOT NULL,
+                    initial_balance DECIMAL(15,2)
                 )
             '''
 
@@ -221,7 +287,11 @@ class DatabaseManager:
                     quantity REAL NOT NULL,
                     entry_price REAL NOT NULL,
                     entry_date TEXT NOT NULL,
-                    last_updated TEXT NOT NULL
+                    last_updated TEXT NOT NULL,
+                    current_price REAL,
+                    stop_loss REAL,
+                    profit_target REAL,
+                    strategy TEXT
                 )
             '''
         else:  # postgresql
@@ -231,7 +301,11 @@ class DatabaseManager:
                     quantity DECIMAL(15,4) NOT NULL,
                     entry_price DECIMAL(15,2) NOT NULL,
                     entry_date TIMESTAMP NOT NULL,
-                    last_updated TIMESTAMP NOT NULL
+                    last_updated TIMESTAMP NOT NULL,
+                    current_price DECIMAL(15,4),
+                    stop_loss DECIMAL(15,4),
+                    profit_target DECIMAL(15,4),
+                    strategy VARCHAR(50)
                 )
             '''
 
