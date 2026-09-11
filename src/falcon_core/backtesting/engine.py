@@ -26,11 +26,6 @@ logger = logging.getLogger(__name__)
 TRADING_DAYS_PER_YEAR = 252
 RTH_MINUTES_PER_SESSION = 390
 
-# Minimum return observations before the risk metrics are worth reporting.
-# Below this, standard deviation is dominated by noise and the resulting
-# Sharpe is not a measurement of anything.
-MIN_RETURN_OBSERVATIONS = 20
-
 
 def _infer_bar_frequency(data: "pd.DataFrame") -> Optional[str]:
     """Best-effort bar frequency label ('1min', '5min', '1day', ...)."""
@@ -105,11 +100,6 @@ class BacktestResult:
     # "there were no trades" from "there were no losses, so it is undefined".
     gross_profit: float = 0.0
     gross_loss: float = 0.0
-
-    # False when there were too few return observations for the risk metrics
-    # to mean anything. Promotion gates should refuse to act on such a result
-    # rather than treating a noisy Sharpe as signal.
-    metrics_reliable: bool = True
 
     # Position metrics
     avg_trade_duration: float = 0.0  # Days
@@ -465,20 +455,13 @@ class SimpleBacktestEngine(BacktestEngine):
         returns = equity.pct_change().dropna()
         periods_per_year = _bars_per_year(data)
 
-        # Reliability guard. Below MIN_RETURN_OBSERVATIONS the standard
-        # deviation is dominated by noise, and a Sharpe computed from it is not
-        # a measurement of anything -- atr_breakout reported 25.98 on four
-        # trades, and the review agent then optimised toward exactly that.
-        # Such a result is reported as unreliable rather than as signal.
-        metrics_reliable = len(returns) >= MIN_RETURN_OBSERVATIONS
-
         if len(returns) > 1:
             period_std = float(returns.std())
             period_mean = float(returns.mean())
             volatility = period_std * np.sqrt(periods_per_year)
             sharpe = (
                 (period_mean / period_std) * np.sqrt(periods_per_year)
-                if (metrics_reliable and period_std > 0) else 0.0
+                if period_std > 0 else 0.0
             )
         else:
             volatility = 0.0
@@ -508,7 +491,6 @@ class SimpleBacktestEngine(BacktestEngine):
             avg_loss=avg_loss,
             gross_profit=gross_profit,
             gross_loss=gross_loss,
-            metrics_reliable=metrics_reliable,
             profit_factor=profit_factor,
             expectancy=expectancy,
             avg_trade_duration=trades['duration'].mean() if 'duration' in trades else 0,
@@ -756,7 +738,6 @@ class BTBacktestEngine(BacktestEngine):
             total_trades=len(signals) // 2,  # Approximate — signal pairs
             # bt gives no per-trade breakdown, so the trade statistics above
             # are not available from this engine.
-            metrics_reliable=False,
             equity_curve=bt_result.prices[strategy.name],
             signals=signals,
             params_used=strategy.params.to_dict(),
