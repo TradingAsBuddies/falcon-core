@@ -245,7 +245,8 @@ class DatabaseManager:
                     quantity REAL NOT NULL,
                     price REAL NOT NULL,
                     timestamp TEXT NOT NULL,
-                    pnl REAL DEFAULT 0
+                    pnl REAL DEFAULT 0,
+                    strategy TEXT
                 )
             '''
         else:  # postgresql
@@ -257,7 +258,8 @@ class DatabaseManager:
                     quantity DECIMAL(15,4) NOT NULL,
                     price DECIMAL(15,2) NOT NULL,
                     timestamp TIMESTAMP NOT NULL,
-                    pnl DECIMAL(15,2) DEFAULT 0
+                    pnl DECIMAL(15,2) DEFAULT 0,
+                    strategy VARCHAR(100)
                 )
             '''
 
@@ -281,11 +283,91 @@ class DatabaseManager:
                 )
             '''
 
+        # Strategy metrics table (read by dashboard charts; written by performance_tracker)
+        if self.db_type == 'sqlite':
+            strategy_metrics_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy TEXT NOT NULL,
+                    stock_type TEXT NOT NULL DEFAULT '',
+                    period_start TEXT NOT NULL DEFAULT '',
+                    period_end TEXT NOT NULL DEFAULT '',
+                    total_trades INTEGER DEFAULT 0,
+                    winning_trades INTEGER DEFAULT 0,
+                    losing_trades INTEGER DEFAULT 0,
+                    win_rate REAL DEFAULT 0,
+                    avg_profit REAL DEFAULT 0,
+                    avg_profit_winners REAL DEFAULT 0,
+                    avg_loss_losers REAL DEFAULT 0,
+                    total_return REAL DEFAULT 0,
+                    max_drawdown REAL DEFAULT 0,
+                    avg_hold_days REAL DEFAULT 0,
+                    sharpe_ratio REAL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    UNIQUE(strategy, stock_type, period_start, period_end)
+                )
+            '''
+        else:  # postgresql
+            strategy_metrics_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_metrics (
+                    id SERIAL PRIMARY KEY,
+                    strategy VARCHAR(100) NOT NULL,
+                    stock_type VARCHAR(50) NOT NULL DEFAULT '',
+                    period_start TIMESTAMP NOT NULL DEFAULT now(),
+                    period_end TIMESTAMP NOT NULL DEFAULT now(),
+                    total_trades INTEGER DEFAULT 0,
+                    winning_trades INTEGER DEFAULT 0,
+                    losing_trades INTEGER DEFAULT 0,
+                    win_rate DOUBLE PRECISION DEFAULT 0,
+                    avg_profit DOUBLE PRECISION DEFAULT 0,
+                    avg_profit_winners DOUBLE PRECISION DEFAULT 0,
+                    avg_loss_losers DOUBLE PRECISION DEFAULT 0,
+                    total_return DOUBLE PRECISION DEFAULT 0,
+                    max_drawdown DOUBLE PRECISION DEFAULT 0,
+                    avg_hold_days DOUBLE PRECISION DEFAULT 0,
+                    sharpe_ratio DOUBLE PRECISION DEFAULT 0,
+                    updated_at TIMESTAMP NOT NULL DEFAULT now(),
+                    UNIQUE(strategy, stock_type, period_start, period_end)
+                )
+            '''
+
+        # Strategy signals table (written by bot._log_strategy_signal; read by /api/signals)
+        if self.db_type == 'sqlite':
+            strategy_signals_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_id INTEGER,
+                    symbol TEXT NOT NULL,
+                    signal_type TEXT,
+                    signal_reason TEXT,
+                    confidence REAL,
+                    market_price REAL,
+                    action_taken TEXT,
+                    timestamp TEXT NOT NULL
+                )
+            '''
+        else:  # postgresql
+            strategy_signals_sql = '''
+                CREATE TABLE IF NOT EXISTS strategy_signals (
+                    id SERIAL PRIMARY KEY,
+                    strategy_id INTEGER,
+                    symbol VARCHAR(20) NOT NULL,
+                    signal_type VARCHAR(10),
+                    signal_reason TEXT,
+                    confidence DOUBLE PRECISION,
+                    market_price DOUBLE PRECISION,
+                    action_taken VARCHAR(30),
+                    timestamp TIMESTAMP NOT NULL DEFAULT now()
+                )
+            '''
+
         # Execute table creation
         self.execute(account_sql)
         self.execute(positions_sql)
         self.execute(orders_sql)
         self.execute(performance_sql)
+        self.execute(strategy_metrics_sql)
+        self.execute(strategy_signals_sql)
 
         logger.info("Trading tables created")
 
