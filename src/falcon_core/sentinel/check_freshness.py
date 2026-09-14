@@ -21,7 +21,13 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from falcon_core.sentinel.base import BaseSentinel, SentinelResult, SentinelStatus
+from falcon_core.market_calendar import previous_session
+from falcon_core.sentinel.base import (
+    BaseSentinel,
+    SentinelResult,
+    SentinelStatus,
+    sessions_since,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,30 +46,16 @@ BACKTEST_WARN_DAYS = 4
 BACKTEST_FAIL_DAYS = 8
 
 
-def _previous_weekday(d: date) -> date:
-    """The most recent weekday strictly before ``d``.
+def _previous_session(d: date) -> date:
+    """The most recent trading session strictly before ``d``.
 
-    The nightly sync loads *yesterday's* bars, so this — not today — is the
-    newest session that should be present. Holidays are not modelled; the
-    staleness thresholds absorb them instead.
+    The nightly sync loads the *previous session's* bars, so this — not today —
+    is the newest data that should be present. This used to skip weekends only,
+    with a comment saying holidays were absorbed by the thresholds. They were
+    not: the day after a holiday, every threshold shifted by one and the check
+    reported an outage that had not happened (falcon-core#30).
     """
-    d -= timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
-
-
-def _weekdays_between(start: date, end: date) -> int:
-    """Count weekdays after ``start`` through ``end`` inclusive."""
-    if end <= start:
-        return 0
-    count = 0
-    cursor = start + timedelta(days=1)
-    while cursor <= end:
-        if cursor.weekday() < 5:
-            count += 1
-        cursor += timedelta(days=1)
-    return count
+    return previous_session(d)
 
 
 def _as_date(value) -> Optional[date]:
@@ -120,8 +112,8 @@ class DataFreshnessSentinel(BaseSentinel):
                 reason="daily_bars is empty — nothing has ever been ingested",
             )
 
-        expected = _previous_weekday(date.today())
-        behind = _weekdays_between(newest_daily, expected)
+        expected = _previous_session(date.today())
+        behind = sessions_since(newest_daily, expected)
 
         details = {
             "daily_newest": str(newest_daily),
@@ -216,13 +208,19 @@ class PipelineFreshnessSentinel(BaseSentinel):
                 problems.append("no successful daily sync on record")
                 escalate(SentinelStatus.FAIL)
             else:
-                age = (date.today() - last_ok).days
-                details["daily_sync_age_days"] = age
+                # Sessions, not calendar days. The sync records no_data when
+                # the market was shut, so the newest *success* is always the
+                # last session — a day delta reports every Monday as two days
+                # of outage (falcon-core#30).
+                age = sessions_since(last_ok)
+                details["daily_sync_age_sessions"] = age
                 if age >= SYNC_FAIL_DAYS:
-                    problems.append(f"last successful daily sync was {age}d ago")
+                    problems.append(
+                        f"last successful daily sync was {age} session(s) ago")
                     escalate(SentinelStatus.FAIL)
                 elif age >= SYNC_WARN_DAYS:
-                    problems.append(f"last successful daily sync was {age}d ago")
+                    problems.append(
+                        f"last successful daily sync was {age} session(s) ago")
                     escalate(SentinelStatus.WARN)
         except Exception as e:
             problems.append(f"sync_log unreadable: {e}")

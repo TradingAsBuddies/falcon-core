@@ -170,3 +170,23 @@ def probe_session(lag_days: int = 3, today: Optional["_dt.date"] = None) -> str:
     if not is_session(target):
         target = previous_session(target)
     return target.strftime("%Y-%m-%d")
+
+
+def sessions_since(day, today: Optional["_dt.date"] = None) -> int:
+    """Trading sessions elapsed after ``day``, up to and including ``today``.
+
+    The natural way to write a staleness check is ``(date.today() - day).days``,
+    and it is wrong every Monday: the nightly pipelines record no_data on days
+    the market was shut, so the newest *success* is always the last session, and
+    a calendar delta counts the weekend as outage. Same defect as the flat-file
+    sentinels reported for Labor Day (falcon-core#20, #30).
+
+    Counting sessions makes "current" mean the same thing on a Tuesday as on the
+    Monday after a long weekend. A gap of zero means nothing has been missed.
+    """
+    from falcon_core.market_calendar import sessions_between
+
+    today = today or _dt.date.today()
+    if day is None or day >= today:
+        return 0
+    return max(len(sessions_between(day, today)) - 1, 0)
