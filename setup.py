@@ -52,6 +52,7 @@ setup(
             "falcon-advisor=falcon_core.advisor_cli:main",
             "falcon-feedback-loop=falcon_core.feedback_loop_cli:main",
             "falcon-sentinel=falcon_core.sentinel.cli:main",
+            "falcon-proposal-review=falcon_core.proposal_review_cli:main",
         ],
     },
     classifiers=[
