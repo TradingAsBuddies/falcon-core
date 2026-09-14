@@ -17,14 +17,15 @@ from typing import Any, Dict, List, Optional, Type
 import pandas as pd
 import numpy as np
 
+from falcon_core import metrics
 from falcon_core.backtesting.strategies.base import BaseStrategy, Signal, SignalType
 
 logger = logging.getLogger(__name__)
 
-#: Trading days in a year, and the RTH minutes in a session -- the two constants
-#: every annualization here derives from.
-TRADING_DAYS_PER_YEAR = 252
-RTH_MINUTES_PER_SESSION = 390
+
+#: Kept as a re-export so existing importers of this name keep working; the
+#: arithmetic itself now lives in falcon_core.metrics.
+TRADING_DAYS_PER_YEAR = metrics.TRADING_DAYS_PER_YEAR
 
 
 def _infer_bar_frequency(data: "pd.DataFrame") -> Optional[str]:
@@ -45,23 +46,6 @@ def _infer_bar_frequency(data: "pd.DataFrame") -> Optional[str]:
     return f"{int(round(seconds / 86400))}day"
 
 
-def _bars_per_year(data: "pd.DataFrame") -> float:
-    """How many bars of this frequency occur in a trading year.
-
-    Used to annualize volatility at the *bar* frequency. The old code always
-    multiplied by sqrt(252) regardless of whether the bars were daily or
-    one-minute, which is off by sqrt(390) on intraday data (falcon-core#21).
-    """
-    freq = _infer_bar_frequency(data)
-    if not freq:
-        return float(TRADING_DAYS_PER_YEAR)
-    if freq.endswith("min"):
-        per_session = RTH_MINUTES_PER_SESSION / max(int(freq[:-3]), 1)
-    elif freq.endswith("h"):
-        per_session = (RTH_MINUTES_PER_SESSION / 60) / max(int(freq[:-1]), 1)
-    else:
-        per_session = 1.0 / max(int(freq[:-3]), 1)
-    return float(TRADING_DAYS_PER_YEAR) * per_session
 
 
 @dataclass
@@ -109,6 +93,9 @@ class BacktestResult:
     # strategy declined to trade both used to look like "0 trades, success"
     # (falcon-core#21). These make them distinguishable on every run row.
     status: str = "ok"          # ok | error
+    #: False when too few daily observations for the risk metrics to mean
+    #: anything. Promotion gates must not act on an unreliable Sharpe.
+    metrics_reliable: bool = True
     reason: Optional[str] = None  # no_data | insufficient_bars | no_signals
     bars_loaded: int = 0
     engine_used: str = "simple"
@@ -148,6 +135,7 @@ class BacktestResult:
             "params_used": self.params_used,
             "status": self.status,
             "reason": self.reason,
+            "metrics_reliable": self.metrics_reliable,
             "bars_loaded": self.bars_loaded,
             "engine_used": self.engine_used,
             "bar_frequency": self.bar_frequency,
@@ -441,7 +429,20 @@ class SimpleBacktestEngine(BacktestEngine):
         # Expectancy
         expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
 
-        # Build equity curve for risk metrics
+        # Build a DAILY equity curve for risk metrics. Trade-indexed steps are
+        # not a unit of time, so anything annualised from them is meaningless
+        # (falcon-core#21).
+        session_dates = sorted({ts.date() for ts in data.index})
+        exits = list(zip(
+            trades['exit_time'] if 'exit_time' in trades else trades.index,
+            trades['pnl_dollar'],
+        ))
+        daily_curve = metrics.daily_equity_curve(
+            self.initial_capital, exits, session_dates,
+        )
+        daily_equity = [value for _, value in daily_curve]
+
+        # Kept for the result payload and the drawdown-duration logic below.
         equity = self._build_equity_curve(trades)
 
         # Risk metrics.
@@ -452,20 +453,17 @@ class SimpleBacktestEngine(BacktestEngine):
         # atr_breakout reported -6.97 on 1914 trades regardless of edge.
         # Annualize at the actual bar frequency instead, and derive Sharpe from
         # the same period returns the volatility came from.
-        returns = equity.pct_change().dropna()
-        periods_per_year = _bars_per_year(data)
+        daily_returns = metrics.simple_returns(daily_equity)
+        volatility = metrics.annualized_volatility(daily_returns)
+        sharpe, metrics_reliable = metrics.sharpe_ratio(daily_returns)
 
-        if len(returns) > 1:
-            period_std = float(returns.std())
-            period_mean = float(returns.mean())
-            volatility = period_std * np.sqrt(periods_per_year)
-            sharpe = (
-                (period_mean / period_std) * np.sqrt(periods_per_year)
-                if period_std > 0 else 0.0
+        if not metrics_reliable and daily_returns:
+            logger.info(
+                "%s/%s: %d daily observations is below the %d needed for a "
+                "meaningful Sharpe; reported as unreliable",
+                strategy.name, symbol, len(daily_returns),
+                metrics.MIN_RETURN_OBSERVATIONS,
             )
-        else:
-            volatility = 0.0
-            sharpe = 0.0
 
         # Max drawdown
         rolling_max = equity.expanding().max()
@@ -500,6 +498,7 @@ class SimpleBacktestEngine(BacktestEngine):
             params_used=strategy.params.to_dict(),
             status='ok',
             reason=None,
+            metrics_reliable=metrics_reliable,
             bars_loaded=len(data),
             engine_used=type(self).__name__,
             bar_frequency=_infer_bar_frequency(data),

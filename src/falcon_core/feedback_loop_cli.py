@@ -1,6 +1,6 @@
 """CLI entry point for the nightly feedback loop (falcon-core#19).
 
-``BacktestScheduler.run_feedback_loop`` is the only writer of the
+``FeedbackLoopScheduler.run_feedback_loop`` is the only writer of the
 ``feedback_results`` table, and nothing in the deployed stack ever called it:
 falcon-trader does not instantiate the scheduler, ``setup.py`` exposed no
 console script for it, and the one ``systemd`` unit that did drive it was never
@@ -105,9 +105,9 @@ def main(argv=None) -> int:
     logger.info("Running feedback loop for %s", trading_date)
 
     try:
-        from falcon_core.backtesting.scheduler import BacktestScheduler
+        from falcon_core.backtesting.scheduler import FeedbackLoopScheduler
 
-        scheduler = BacktestScheduler()
+        scheduler = FeedbackLoopScheduler()
         if args.dry_run:
             logger.info("--dry-run: computing without persisting")
         results = scheduler.run_feedback_loop(trading_date)
