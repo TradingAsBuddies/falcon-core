@@ -30,10 +30,33 @@ class MarketPageSentinel(BaseSentinel):
                 reason="No Polygon API key available",
             )
 
-        # 1. Fetch from the market page API
+        # 1. Fetch from the market page API.
+        #
+        # The dashboard requires a credential on every route but /health since
+        # falcon-trader#28. Without this header the check reports HTTP 401,
+        # which reads as "the endpoint is broken" when it means "the sentinel
+        # cannot log in" -- a failure about the checker, dressed as a failure
+        # about the thing checked.
         dashboard_url = os.environ.get('FALCON_DASHBOARD_URL', 'http://falcon-dashboard:5000')
+        headers = {}
+        token = (os.environ.get('FALCON_API_TOKEN') or '').strip()
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+
         try:
-            page_resp = http_requests.get(f"{dashboard_url}/api/market", timeout=15)
+            page_resp = http_requests.get(
+                f"{dashboard_url}/api/market", timeout=15, headers=headers,
+            )
+            if page_resp.status_code in (401, 403):
+                # Distinguish "no credential configured" from "credential rejected".
+                detail = ("FALCON_API_TOKEN is not set for the sentinel"
+                          if not token else "the configured token was rejected")
+                return SentinelResult(
+                    name=self.name,
+                    status=SentinelStatus.FAIL,
+                    reason=(f"/api/market returned HTTP {page_resp.status_code} — "
+                            f"{detail}"),
+                )
             if page_resp.status_code != 200:
                 return SentinelResult(
                     name=self.name,
