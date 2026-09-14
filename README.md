@@ -38,7 +38,13 @@ stocks = client.get_stocks(filters="sh_avgvol_o750,sh_price_u20", limit=30)
 ### Configuration
 Environment variables:
 - `DB_TYPE` - `sqlite` or `postgresql`
-- `DB_PATH` - Path to SQLite database
+- `DB_PATH` - Path to SQLite database (used when `DB_TYPE=sqlite`)
+- `DATABASE_URL` - Full PostgreSQL connection string (e.g. `postgresql://user:pass@host:5432/dbname`); takes precedence over the individual `DB_*` variables below
+- `DB_HOST` - PostgreSQL host (used when `DB_TYPE=postgresql` and `DATABASE_URL` is not set)
+- `DB_PORT` - PostgreSQL port (default: `5432`)
+- `DB_NAME` - PostgreSQL database name
+- `DB_USER` - PostgreSQL username
+- `DB_PASSWORD` - PostgreSQL password
 - `FINVIZ_AUTH_KEY` - Finviz Elite authentication key
 
 ## License

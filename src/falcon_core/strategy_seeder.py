@@ -199,6 +199,8 @@ def run_backtests(db) -> Dict[str, Any]:
         all_win_rates = []
         all_sharpes = []
         total_trades = 0
+        total_gross_profit = 0.0
+        total_gross_loss = 0.0
 
         for symbol in symbols:
             try:
@@ -223,6 +225,8 @@ def run_backtests(db) -> Dict[str, Any]:
                 if hasattr(result, 'sharpe_ratio') and result.sharpe_ratio is not None:
                     all_sharpes.append(result.sharpe_ratio)
                 total_trades += result.total_trades
+                total_gross_profit += float(getattr(result, 'gross_profit', 0.0) or 0.0)
+                total_gross_loss += float(getattr(result, 'gross_loss', 0.0) or 0.0)
 
                 logger.info(
                     f"    {symbol}: {result.total_return:.2%} return, "
@@ -256,8 +260,16 @@ def run_backtests(db) -> Dict[str, Any]:
             avg_return = float(sum(all_returns) / len(all_returns))
             avg_win_rate = float(sum(all_win_rates) / len(all_win_rates))
             avg_sharpe = float(sum(all_sharpes) / len(all_sharpes)) if all_sharpes else 0.0
-            # Profit factor approximation from win rate and R/R
-            profit_factor = float((avg_win_rate * 2) / (1 - avg_win_rate)) if avg_win_rate < 1 else 10.0
+            # Profit factor from the engine's realised gross P&L, summed across
+            # symbols. It used to be re-derived here as (win_rate * 2) / (1 -
+            # win_rate), a stand-in that assumed a fixed 2:1 reward-to-risk
+            # nothing guarantees — so the roster and dashboard were showing a
+            # figure computed from win rate alone. No losing trades means the
+            # ratio is undefined, not a large number.
+            if total_gross_loss > 0:
+                profit_factor = float(total_gross_profit / total_gross_loss)
+            else:
+                profit_factor = None
 
             now = datetime.now().isoformat()
             db.execute(
