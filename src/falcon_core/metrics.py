@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
+import statistics as _statistics
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
@@ -108,11 +109,17 @@ def _mean(xs: Sequence[float]) -> float:
 
 
 def _stdev(xs: Sequence[float]) -> float:
-    """Sample standard deviation, matching pandas' default ddof=1."""
+    """Sample standard deviation, matching pandas' default ddof=1.
+
+    Delegates to `statistics.stdev`, which carries exact fractions
+    internally. The hand-rolled form, sqrt(sum((x - mean)**2)/(n-1)), is not
+    exact for a constant series: the computed mean of [0.001] * 50 is
+    0.0010000000000000007, so every (x - m) is a non-zero residual and the
+    result is ~6.6e-19 rather than 0.0, defeating any `sd == 0.0` guard.
+    """
     if len(xs) < 2:
         return 0.0
-    m = _mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+    return _statistics.stdev(xs)
 
 
 def annualized_volatility(
@@ -148,7 +155,12 @@ def sharpe_ratio(
     excess = [r - per_period_rf for r in daily_returns]
 
     sd = _stdev(excess)
-    if sd == 0.0:
+    # Relative, not `sd == 0.0`. An exact comparison only catches variance that
+    # cancels perfectly in floating point; a series constant to within rounding
+    # still yields a tiny sd, and mean/sd then reports an astronomically
+    # confident Sharpe on what is actually a flat equity curve.
+    scale = max((abs(x) for x in excess), default=0.0)
+    if sd <= scale * 1e-12:
         return 0.0, False
 
     sharpe = (_mean(excess) / sd) * math.sqrt(periods_per_year)

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Type
 import pandas as pd
 import numpy as np
 
+from falcon_core import metrics
 from falcon_core.backtesting.strategies.base import BaseStrategy, Signal, SignalType
 
 logger = logging.getLogger(__name__)
