@@ -14,6 +14,7 @@ import pytest
 from falcon_core.market_calendar import is_session
 from falcon_core.sentinel.base import (
     BaseSentinel,
+    sessions_since,
     SentinelResult,
     SentinelRunner,
     SentinelStatus,
@@ -138,3 +139,41 @@ def test_result_serializes():
     d = SentinelResult(name="x", status=SentinelStatus.SKIP, reason="r").to_dict()
     assert d["status"] == "skip"
     assert d["name"] == "x"
+
+
+# ── sessions_since ──────────────────────────────────────────────────────
+
+def test_sessions_since_weekend_is_one_not_three():
+    """The regression: a Monday must not read as a multi-day outage.
+
+    The nightly pipelines record no_data when the market was shut, so the
+    newest success is always the last session. (today - day).days counted
+    Saturday and Sunday as missed work and warned every Monday.
+    """
+    # Friday 2026-09-11 -> Monday 2026-09-14
+    assert sessions_since(dt.date(2026, 9, 11), dt.date(2026, 9, 14)) == 1
+    assert (dt.date(2026, 9, 14) - dt.date(2026, 9, 11)).days == 3  # the old answer
+
+
+def test_sessions_since_holiday_week():
+    """Labor Day 2026-09-07 must not count as a missed session."""
+    # Friday 09-04 -> Tuesday 09-08, with Monday a holiday: one session (09-08).
+    assert sessions_since(dt.date(2026, 9, 4), dt.date(2026, 9, 8)) == 1
+
+
+def test_sessions_since_same_session_is_zero():
+    assert sessions_since(dt.date(2026, 9, 11), dt.date(2026, 9, 11)) == 0
+
+
+def test_sessions_since_non_session_day_adds_nothing():
+    # Friday -> Saturday: no session has passed.
+    assert sessions_since(dt.date(2026, 9, 11), dt.date(2026, 9, 12)) == 0
+
+
+def test_sessions_since_consecutive_sessions():
+    assert sessions_since(dt.date(2026, 9, 10), dt.date(2026, 9, 11)) == 1
+
+
+def test_sessions_since_handles_none_and_future():
+    assert sessions_since(None, dt.date(2026, 9, 14)) == 0
+    assert sessions_since(dt.date(2026, 9, 20), dt.date(2026, 9, 14)) == 0
