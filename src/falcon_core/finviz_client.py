@@ -157,7 +157,17 @@ class FinvizClient:
     # Standard screener URL (for free tier fallback)
     SCREENER_BASE_URL = "https://finviz.com/screener.ashx"
 
-    # Common column IDs for CSV export
+    # Column IDs for the Elite CSV export.
+    #
+    # These are positions in Finviz's own column list, and they have moved:
+    # price/change/volume were 8/9/10 and are now 65/66/67. Asking for the old
+    # ids returned Forward P/E, PEG and P/S, so the export carried no Volume or
+    # Average Volume column at all -- every row then read as $0 average dollar
+    # volume and the screener's liquidity floor dropped all of them
+    # (falcon-screener produced 0 recommendations every run).
+    #
+    # To re-derive after a Finviz change: request c=1,2,...,100 and read the
+    # header row back. Verified 2026-09-30.
     COLUMNS = {
         'ticker': 1,
         'company': 2,
@@ -166,22 +176,35 @@ class FinvizClient:
         'country': 5,
         'market_cap': 6,
         'pe': 7,
-        'price': 8,
-        'change': 9,
-        'volume': 10,
-        'avg_volume': 64,
-        'rsi': 65,
-        'rel_volume': 66,
+        'rsi': 59,
+        'avg_volume': 63,
+        'rel_volume': 64,
+        'price': 65,
+        'change': 66,
+        'volume': 67,
         'earnings_date': 68,
         'target_price': 69,
         'perf_5min': 93,
     }
 
-    # Default columns for comprehensive data
-    DEFAULT_COLUMNS = "1,2,3,4,6,7,8,9,10,65,66,93"
+    #: Fields every screening path needs. Built from COLUMNS rather than
+    #: written out, so a corrected id cannot be corrected in only one place.
+    DEFAULT_FIELDS = ('ticker', 'company', 'sector', 'industry', 'market_cap',
+                      'pe', 'rsi', 'avg_volume', 'rel_volume', 'price',
+                      'change', 'volume', 'perf_5min')
 
-    # Columns for earnings-focused screening (includes earnings date)
-    EARNINGS_COLUMNS = "1,2,3,4,6,7,8,9,10,64,65,66,68,69,93"
+    #: Earnings screening also needs the date and the target price.
+    EARNINGS_FIELDS = DEFAULT_FIELDS + ('earnings_date', 'target_price')
+
+    #: Finviz exports Average Volume in *thousands* of shares while Volume is
+    #: in shares. Confirmed 2026-09-30: AAPL 47111.23 (47.1M ADV), NVDA
+    #: 124149.86 (124M). The HTML scrape path yields shares, so the CSV value
+    #: is scaled here and every consumer sees shares.
+    AVG_VOLUME_MULTIPLIER = 1000.0
+
+    @classmethod
+    def _columns_for(cls, fields) -> str:
+        return ",".join(str(cls.COLUMNS[f]) for f in fields)
 
     def __init__(self, auth_key: Optional[str] = None,
                  rate_limit_config: Optional[RateLimitConfig] = None):
@@ -346,7 +369,7 @@ class FinvizClient:
 
         params = {
             'v': view,
-            'c': columns or self.DEFAULT_COLUMNS,
+            'c': columns or self._columns_for(self.DEFAULT_FIELDS),
             'auth': self.auth_key
         }
 
@@ -371,7 +394,12 @@ class FinvizClient:
         reader = csv.DictReader(StringIO(csv_data))
 
         for row in reader:
-            # Normalize keys to snake_case
+            # Normalize keys to snake_case.
+            #
+            # price, volume and avg_volume are None when the column is absent
+            # or unparseable -- never 0. They gate the liquidity floor, and a
+            # missing column read as 0 makes every stock look illiquid while
+            # logging it as a genuine "$0 average dollar volume" rejection.
             stock = {
                 'ticker': row.get('Ticker', ''),
                 'company': row.get('Company', ''),
@@ -379,11 +407,11 @@ class FinvizClient:
                 'industry': row.get('Industry', ''),
                 'market_cap': row.get('Market Cap', ''),
                 'pe_ratio': row.get('P/E', ''),
-                'price': self._parse_float(row.get('Price', '0')),
+                'price': self._optional_float(row.get('Price')),
                 'change': row.get('Change', ''),
                 'change_pct': self._parse_percent(row.get('Change', '0%')),
-                'volume': self._parse_int(row.get('Volume', '0')),
-                'avg_volume': self._parse_float(row.get('Average Volume', '0')),
+                'volume': self._optional_int(row.get('Volume')),
+                'avg_volume': self._avg_volume_shares(row.get('Average Volume')),
                 'rsi': self._parse_float(row.get('RSI (14)', row.get('Relative Strength Index (14)', '50'))),
                 'rel_volume': self._parse_float(row.get('Relative Volume', '1')),
                 'earnings_date': row.get('Earnings Date', ''),
@@ -397,6 +425,27 @@ class FinvizClient:
             stocks.append(stock)
 
         return stocks
+
+    def _optional_float(self, value) -> Optional[float]:
+        """Float, or None when the value is missing or unparseable."""
+        if value is None:
+            return None
+        text = str(value).strip().replace(',', '').replace('%', '').replace('$', '')
+        if not text or text in {'-', '--', 'N/A', 'n/a'}:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _optional_int(self, value) -> Optional[int]:
+        parsed = self._optional_float(value)
+        return None if parsed is None else int(parsed)
+
+    def _avg_volume_shares(self, value) -> Optional[float]:
+        """Average volume in shares, from Finviz's thousands-of-shares cell."""
+        parsed = self._optional_float(value)
+        return None if parsed is None else parsed * self.AVG_VOLUME_MULTIPLIER
 
     def _parse_float(self, value: str) -> float:
         """Parse float from string, handling commas and errors"""
@@ -439,7 +488,7 @@ class FinvizClient:
         """
         # Auto-detect if we should include earnings columns
         if include_earnings or (filters and 'earnings' in filters.lower()):
-            columns = columns or self.EARNINGS_COLUMNS
+            columns = columns or self._columns_for(self.EARNINGS_FIELDS)
 
         csv_data = self.fetch_csv(filters=filters, columns=columns)
 
@@ -455,10 +504,12 @@ class FinvizClient:
 
             # Sort by multiple criteria
             stocks.sort(
+                # `or 0`: volume and rel_volume are None when Finviz omitted
+                # the column, and None is not orderable against a float.
                 key=lambda s: (
-                    abs(s.get('performance_5min', 0)),
-                    s.get('rel_volume', 0),
-                    s.get('volume', 0)
+                    abs(s.get('performance_5min') or 0),
+                    s.get('rel_volume') or 0,
+                    s.get('volume') or 0,
                 ),
                 reverse=True
             )
