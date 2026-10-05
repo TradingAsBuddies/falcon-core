@@ -112,6 +112,11 @@ class SentinelRunner:
             ("falcon_core.sentinel.check_backtest_engine", "BacktestEngineSentinel"),
             ("falcon_core.sentinel.check_timezone", "TimezoneSentinel"),
             ("falcon_core.sentinel.check_market_page", "MarketPageSentinel"),
+            # Output-side checks. Every sentinel above verifies an input, and
+            # all of them passed through 13 days of zero recommendations and
+            # 24 days of zero orders.
+            ("falcon_core.sentinel.check_trading_activity", "ScreenerOutputSentinel"),
+            ("falcon_core.sentinel.check_trading_activity", "TradingActivitySentinel"),
         ]
 
         for module_path, class_name in sentinel_factories:

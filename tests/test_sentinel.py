@@ -131,6 +131,7 @@ def test_builtin_sentinels_all_load():
         "database", "data-feed", "data-feed-minute", "polygon-minute",
         "strategy-roster", "backtest-engine", "timezone", "market-page",
         "data-freshness", "pipeline-freshness",
+        "screener-output", "trading-activity",
     ):
         assert expected in names, f"{expected} missing from {names}"
 
