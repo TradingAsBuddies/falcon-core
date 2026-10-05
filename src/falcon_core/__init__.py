@@ -16,6 +16,7 @@ from falcon_core.finviz_client import (
     fetch_finviz_stocks,
 )
 from falcon_core.config import FalconConfig, get_config
+from falcon_core import prices
 
 # Backtesting module (lazy import to avoid dependency issues)
 def get_backtest_engine(*args, **kwargs):
@@ -40,6 +41,7 @@ def get_data_sync_pipeline(*args, **kwargs):
 
 __version__ = "0.2.0"
 __all__ = [
+    'prices',
     # Database
     "DatabaseManager",
     "get_db_manager",
