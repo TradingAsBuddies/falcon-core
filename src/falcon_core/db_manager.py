@@ -126,6 +126,53 @@ class DatabaseManager:
             finally:
                 self.pool.putconn(conn)
 
+    @staticmethod
+    def _normalize_params(params):
+        """Convert numpy scalars to plain Python values.
+
+        numpy.float64 is a *subclass of float*, so psycopg2 accepts it and
+        adapts it the way it adapts any float: with repr(). numpy 2 changed
+        that repr from "9.46" to "np.float64(9.46)", which lands in the SQL as
+        an unquoted literal:
+
+            INSERT INTO orders (...) VALUES ('CX', 'BUY', 158, np.float64(9.46)...
+            ERROR: schema "np" does not exist
+
+        Every write carrying a price derived from pandas therefore failed:
+        on 2026-10-05 the orchestrator could not place a single order and could
+        not update one position's price, while reporting "No entry signal" and
+        "No open positions to monitor" (falcon-core#38). Prices come from
+        pandas via the market data fetcher, so this is most of them.
+
+        Fixed here rather than at the call sites: every write in three repos
+        goes through this method, and the next one would have the same bug.
+        Duck-typed on .item() so falcon-core keeps no numpy dependency.
+        """
+        if not params:
+            return params
+
+        def plain(value):
+            if isinstance(value, (str, bytes, bool, int, float)) or value is None:
+                # A float *subclass* (numpy.float64) must still be rebuilt as a
+                # plain float: isinstance passes but repr() is the problem.
+                if type(value) in (str, bytes, bool, int, float, type(None)):
+                    return value
+            item = getattr(value, "item", None)
+            if callable(item):
+                try:
+                    return item()
+                except (TypeError, ValueError):     # pragma: no cover
+                    return value
+            return value
+
+        if isinstance(params, dict):
+            return {key: plain(value) for key, value in params.items()}
+        if isinstance(params, tuple):
+            return tuple(plain(value) for value in params)
+        if isinstance(params, list):
+            return [plain(value) for value in params]
+        return params
+
     def execute(self, query: str, params: Optional[Tuple] = None,
                 fetch: str = 'none') -> Any:
         """
@@ -143,6 +190,8 @@ class DatabaseManager:
         # Convert %s placeholders to ? for SQLite
         if self.db_type == 'sqlite':
             query = query.replace('%s', '?')
+
+        params = self._normalize_params(params)
 
         with self.get_connection() as conn:
             # Use RealDictCursor for PostgreSQL to get dict-like rows
@@ -181,6 +230,8 @@ class DatabaseManager:
         """Execute a query multiple times with different parameters"""
         if self.db_type == 'sqlite':
             query = query.replace('%s', '?')
+
+        params_list = [self._normalize_params(p) for p in (params_list or [])]
 
         with self.get_connection() as conn:
             cursor = conn.cursor()
