@@ -251,6 +251,7 @@ class DatabaseManager:
         self._create_advisor_tables()
         self._create_backtest_results_tables()
         self._migrate_trading_columns()
+        self._migrate_price_scale()
         logger.info("Database schema initialized successfully")
 
     #: Columns the trader writes that the original CREATE TABLE statements
@@ -259,15 +260,76 @@ class DatabaseManager:
     #: `SELECT initial_balance FROM account` raised (falcon-trader#28).
     _TRADING_COLUMN_MIGRATIONS = {
         "positions": {
-            "current_price": {"sqlite": "REAL", "postgresql": "DECIMAL(15,4)"},
-            "stop_loss": {"sqlite": "REAL", "postgresql": "DECIMAL(15,4)"},
-            "profit_target": {"sqlite": "REAL", "postgresql": "DECIMAL(15,4)"},
+            "current_price": {"sqlite": "REAL", "postgresql": "DECIMAL(15,3)"},
+            "stop_loss": {"sqlite": "REAL", "postgresql": "DECIMAL(15,3)"},
+            "profit_target": {"sqlite": "REAL", "postgresql": "DECIMAL(15,3)"},
             "strategy": {"sqlite": "TEXT", "postgresql": "VARCHAR(50)"},
         },
         "account": {
             "initial_balance": {"sqlite": "REAL", "postgresql": "DECIMAL(15,2)"},
         },
     }
+
+    #: Decimals a price column must carry. The operator's convention: below
+    #: $52 a price is quoted to the thousandth, so storage has to hold one.
+    #: Columns were created DECIMAL(15,2), which rounded every write to cents --
+    #: a $1.345 stop became $1.35, which is 0.37% away on that name.
+    PRICE_SCALE = 3
+
+    #: Columns holding a *price*. Money totals (cash, pnl) stay at 2: a total
+    #: is paid in cents, and a third decimal there would be fictional.
+    _PRICE_COLUMNS = {
+        "positions": ("entry_price", "current_price", "stop_loss", "profit_target"),
+        "orders": ("price",),
+    }
+
+    def _price_columns_to_widen(self) -> list:
+        """(table, column, scale) for every price column below PRICE_SCALE.
+
+        PostgreSQL only: SQLite's REAL has no declared scale, so there is
+        nothing to widen there.
+        """
+        if self.db_type != 'postgresql':
+            return []
+
+        wanted = {(t, c) for t, cols in self._PRICE_COLUMNS.items() for c in cols}
+        try:
+            rows = self.execute(
+                "SELECT table_name, column_name, numeric_scale "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND data_type = 'numeric'",
+                fetch='all',
+            ) or []
+        except Exception as exc:
+            logger.warning("Could not inspect numeric scales: %s", exc)
+            return []
+
+        pending = []
+        for row in rows:
+            key = (row["table_name"], row["column_name"])
+            scale = row["numeric_scale"]
+            if key in wanted and scale is not None and scale < self.PRICE_SCALE:
+                pending.append((key[0], key[1], scale))
+        return sorted(pending)
+
+    def _migrate_price_scale(self):
+        """Widen price columns to PRICE_SCALE decimals. Idempotent.
+
+        The only retype this class performs, and it is allowed because
+        *widening* a numeric scale cannot lose data: every value representable
+        at (15,2) is representable at (15,3). Narrowing would silently round
+        live prices and is not done here.
+        """
+        for table, column, scale in self._price_columns_to_widen():
+            try:
+                self.execute(
+                    f"ALTER TABLE {table} "
+                    f"ALTER COLUMN {column} TYPE DECIMAL(15,{self.PRICE_SCALE})"
+                )
+                logger.info("Widened %s.%s from scale %s to %s",
+                            table, column, scale, self.PRICE_SCALE)
+            except Exception as exc:
+                logger.error("Could not widen %s.%s: %s", table, column, exc)
 
     def _existing_columns(self, table: str) -> set:
         """Column names on `table`, or an empty set if it does not exist."""
@@ -350,12 +412,12 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS positions (
                     symbol VARCHAR(20) PRIMARY KEY,
                     quantity DECIMAL(15,4) NOT NULL,
-                    entry_price DECIMAL(15,2) NOT NULL,
+                    entry_price DECIMAL(15,3) NOT NULL,
                     entry_date TIMESTAMP NOT NULL,
                     last_updated TIMESTAMP NOT NULL,
-                    current_price DECIMAL(15,4),
-                    stop_loss DECIMAL(15,4),
-                    profit_target DECIMAL(15,4),
+                    current_price DECIMAL(15,3),
+                    stop_loss DECIMAL(15,3),
+                    profit_target DECIMAL(15,3),
                     strategy VARCHAR(50)
                 )
             '''
@@ -380,7 +442,7 @@ class DatabaseManager:
                     symbol VARCHAR(20) NOT NULL,
                     side VARCHAR(10) NOT NULL,
                     quantity DECIMAL(15,4) NOT NULL,
-                    price DECIMAL(15,2) NOT NULL,
+                    price DECIMAL(15,3) NOT NULL,
                     timestamp TIMESTAMP NOT NULL,
                     pnl DECIMAL(15,2) DEFAULT 0
                 )
