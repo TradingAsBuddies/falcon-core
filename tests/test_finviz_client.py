@@ -126,3 +126,55 @@ def test_sorting_does_not_crash_when_volume_is_missing(monkeypatch):
                         lambda **kw: "\n".join([STALE_HEADERS, STALE_ROW]))
     stocks = client.get_stocks(filters="sh_price_o5", sort_by_5min=True)
     assert [s["ticker"] for s in stocks] == ["CAG"]
+
+
+# ── market capitalisation units ─────────────────────────────────────────
+
+MEGA_HEADERS = "Ticker,Market Cap,Price"
+AAPL_MEGA = "AAPL,4859715.75,332.99"
+KO_MEGA = "KO,372901.90,86.67"
+CDNA_ROW = "CDNA,3613.63,22.45"
+
+
+def _mega(*lines):
+    return _client().parse_csv("\n".join((MEGA_HEADERS,) + lines))
+
+
+def test_market_cap_is_converted_from_millions_to_dollars():
+    """Finviz exports Market Cap in millions with no suffix.
+
+    Read as dollars, every stock looked smaller than $10B: the trader
+    classified all 23 of 2026-10-06's candidates as small_cap, and nothing
+    could ever be mid or large cap.
+    """
+    row = _mega(AAPL_MEGA)[0]
+    assert row["market_cap_usd"] == pytest.approx(4.85971575e12)
+
+
+@pytest.mark.parametrize("line,expected", [
+    (AAPL_MEGA, 4.85971575e12),   # $4.86T
+    (KO_MEGA, 3.729019e11),       # $373B
+    (CDNA_ROW, 3.61363e9),        # $3.6B
+])
+def test_each_size_lands_in_the_right_decade(line, expected):
+    assert _mega(line)[0]["market_cap_usd"] == pytest.approx(expected)
+
+
+def test_the_raw_cell_is_still_available_for_display():
+    row = _mega(AAPL_MEGA)[0]
+    assert row["market_cap"] == "4859715.75"
+
+
+@pytest.mark.parametrize("cell", ["", "-", "N/A", "junk"])
+def test_an_unusable_market_cap_is_none(cell):
+    assert _mega(f"AAPL,{cell},332.99")[0]["market_cap_usd"] is None
+
+
+def test_a_missing_market_cap_column_is_none():
+    row = _client().parse_csv("Ticker,Price\nAAPL,332.99")[0]
+    assert row["market_cap_usd"] is None
+
+
+def test_a_mega_cap_clears_the_large_cap_threshold():
+    """100e9 is the router's large_cap threshold; AAPL must clear it."""
+    assert _mega(AAPL_MEGA)[0]["market_cap_usd"] > 100e9
