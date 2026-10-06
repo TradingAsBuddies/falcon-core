@@ -202,6 +202,13 @@ class FinvizClient:
     #: is scaled here and every consumer sees shares.
     AVG_VOLUME_MULTIPLIER = 1000.0
 
+    #: Market Cap is exported in *millions* of dollars, with no suffix.
+    #: Confirmed 2026-10-06: AAPL 4859715.75 ($4.86T), KO 372901.90 ($373B),
+    #: CDNA 3613.63 ($3.6B). Read as dollars, every stock looked smaller than
+    #: $10B: the trader classified all 23 of that morning's candidates as
+    #: small_cap and nothing could ever be mid or large cap.
+    MARKET_CAP_MULTIPLIER = 1_000_000.0
+
     @classmethod
     def _columns_for(cls, fields) -> str:
         return ",".join(str(cls.COLUMNS[f]) for f in fields)
@@ -406,6 +413,9 @@ class FinvizClient:
                 'sector': row.get('Sector', ''),
                 'industry': row.get('Industry', ''),
                 'market_cap': row.get('Market Cap', ''),
+                # Absolute dollars, because the raw cell is in millions. Named
+                # for its unit so no consumer has to guess which one it holds.
+                'market_cap_usd': self._market_cap_usd(row.get('Market Cap')),
                 'pe_ratio': row.get('P/E', ''),
                 'price': self._optional_float(row.get('Price')),
                 'change': row.get('Change', ''),
@@ -441,6 +451,11 @@ class FinvizClient:
     def _optional_int(self, value) -> Optional[int]:
         parsed = self._optional_float(value)
         return None if parsed is None else int(parsed)
+
+    def _market_cap_usd(self, value) -> Optional[float]:
+        """Market capitalisation in dollars, from Finviz's millions cell."""
+        parsed = self._optional_float(value)
+        return None if parsed is None else parsed * self.MARKET_CAP_MULTIPLIER
 
     def _avg_volume_shares(self, value) -> Optional[float]:
         """Average volume in shares, from Finviz's thousands-of-shares cell."""
