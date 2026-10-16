@@ -72,6 +72,14 @@ class BacktestResult:
     total_trades: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
+
+    # Signals the strategy produced, and how many survived validation. Without
+    # these, "the strategy saw nothing" and "every signal it saw was rejected"
+    # are the same row: 0 trades, 0.00% return. backtest_runs.signals_count was
+    # read from an attribute no result carried, so it was 0 on all 1,475 rows
+    # ever written (falcon-core#42).
+    signals_count: int = 0
+    signals_rejected: int = 0
     win_rate: float = 0.0
     avg_win: float = 0.0
     avg_loss: float = 0.0
@@ -270,16 +278,30 @@ class SimpleBacktestEngine(BacktestEngine):
 
         # Generate signals
         signals = strategy.run(data, symbol)
+        generated = getattr(strategy, 'signals_generated', len(signals))
+        rejected = max(generated - len(signals), 0)
 
         if not signals:
-            logger.warning(f"No signals generated for {symbol}")
-            return self._empty_result(strategy, data, symbol)
+            if generated:
+                logger.warning(
+                    "%s/%s: %d signal(s) generated, all rejected by validation",
+                    strategy.name, symbol, generated,
+                )
+            else:
+                logger.warning(f"No signals generated for {symbol}")
+            result = self._empty_result(strategy, data, symbol)
+            result.signals_count = generated
+            result.signals_rejected = rejected
+            return result
 
         # Simulate trades
         trades = self._simulate_trades(signals, data)
 
         # Calculate metrics
-        return self._calculate_metrics(strategy, data, symbol, signals, trades)
+        result = self._calculate_metrics(strategy, data, symbol, signals, trades)
+        result.signals_count = generated
+        result.signals_rejected = rejected
+        return result
 
     def _simulate_trades(
         self,

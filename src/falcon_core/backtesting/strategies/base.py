@@ -11,7 +11,26 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import logging
+from datetime import datetime, time as _time
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
+
+#: Market time. Every strategy parameter in this platform is Eastern.
+EASTERN = ZoneInfo("America/New_York")
+
+
+def eastern_time_of(moment: datetime) -> _time:
+    """The wall-clock Eastern time of `moment`, for comparing against params.
+
+    A tz-aware timestamp is converted; the data feed supplies bar indexes in
+    UTC. A naive timestamp is assumed to be Eastern already, which is this
+    platform's convention for naive market data.
+    """
+    if moment.tzinfo is not None:
+        return moment.astimezone(EASTERN).time()
+    return moment.time()
 
 
 class SignalType(Enum):
@@ -77,7 +96,13 @@ class StrategyParams:
     # Filters
     min_volume: int = 100000  # Minimum volume filter
     min_price: float = 1.0  # Minimum price filter
-    max_price: float = 500.0  # Maximum price filter
+    # No upper price filter by default. This was 500.0, which silently excluded
+    # the most liquid instruments the platform trades: SPY at $770, MSFT at
+    # $527, NVDA, QQQ. On SPY it rejected 30 of 78 generated signals, and the
+    # trade-window bug below rejected the other 48 -- so every backtest on a
+    # high-priced symbol reported 0 trades and 0.00% return. Set a value to
+    # bound it per strategy; None means unbounded.
+    max_price: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization"""
@@ -242,9 +267,18 @@ class BaseStrategy(ABC):
             if current_positions >= self.params.max_positions:
                 return False
 
-        # Check trading hours (only block new entries, allow exits through)
+        # Check trading hours (only block new entries, allow exits through).
+        #
+        # trade_start_time and trade_end_time are Eastern -- market time, as
+        # every strategy parameter in this platform is. The signal timestamp
+        # comes from the bar index, which the data feed supplies in UTC, and
+        # this compared the two directly: a UTC stamp of 19:45 read as 19:45
+        # against a 15:30 cutoff and was dropped. Only 09:35-15:30 *UTC*, which
+        # is 05:35-11:30 ET, could pass, so every afternoon signal died
+        # silently. 48 of 78 signals on SPY, and the reason backtests reported
+        # 0.00% (falcon-core#42).
         if isinstance(signal.timestamp, datetime):
-            signal_time = signal.timestamp.time()
+            signal_time = eastern_time_of(signal.timestamp)
             start = datetime.strptime(self.params.trade_start_time, "%H:%M").time()
             end = datetime.strptime(self.params.trade_end_time, "%H:%M").time()
             if signal.signal_type in [SignalType.LONG, SignalType.SHORT]:
@@ -254,7 +288,7 @@ class BaseStrategy(ABC):
         # Check price filters
         if signal.price < self.params.min_price:
             return False
-        if signal.price > self.params.max_price:
+        if self.params.max_price is not None and signal.price > self.params.max_price:
             return False
 
         # Check confidence threshold
@@ -300,6 +334,21 @@ class BaseStrategy(ABC):
                     current_positions += 1
                 elif signal.signal_type in [SignalType.EXIT_LONG, SignalType.EXIT_SHORT]:
                     current_positions = max(0, current_positions - 1)
+
+        # Counted so a backtest can tell "the strategy saw nothing" from "every
+        # signal it saw was rejected". backtest_runs.signals_count was written
+        # from an attribute no result carried, so it read 0 on all 1,475 rows
+        # ever recorded -- and the two failure modes looked identical.
+        self.signals_generated = len(signals)
+        self.signals_validated = len(validated_signals)
+        if signals and not validated_signals:
+            logger.warning(
+                "%s: all %d signals rejected by validate_signal "
+                "(window %s-%s ET, price %s-%s)",
+                self.name, len(signals), self.params.trade_start_time,
+                self.params.trade_end_time, self.params.min_price,
+                self.params.max_price,
+            )
 
         self._signals = validated_signals
         return validated_signals
